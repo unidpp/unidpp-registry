@@ -1,0 +1,18 @@
+[package]
+name = "unidpp-registry"
+description = "UniDPP ISO 19135 registry service: item registration, versioned supersession with derived window ends, point-in-time (as-of) resolution, applicability bindings with retroactivity, subregisters as item classes, append-only audit log"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/unidpp/unidpp-registry"
+rust-version = "1.75"
+
+# Dependency-light on purpose (mirrors unidpp-resolver doctrine): axum/
+# tokio for serving, serde_json for wire documents. No tracing, no
+# metrics, no TLS stack (production terminates TLS at a fronting proxy).
+# Storage is the in-memory model plus a JSONL append-only journal (see
+# README "Storage choice") — no database dependency.
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "net", "io-util", "rt-multi-thread", "time"] }
+serde_json = "1"
