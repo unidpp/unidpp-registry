@@ -12,7 +12,12 @@ rust-version = "1.75"
 # metrics, no TLS stack (production terminates TLS at a fronting proxy).
 # Storage is the in-memory model plus a JSONL append-only journal (see
 # README "Storage choice") — no database dependency.
+# ed25519-dalek is the only crypto dep, used by the discovery descriptor
+# verification path (C3 signed service descriptors); sign and verify
+# only — no keypair persistence, no external RNG, no TLS.
 [dependencies]
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "net", "io-util", "rt-multi-thread", "time"] }
 serde_json = "1"
+ed25519-dalek = "2"
+sha2 = "0.10"

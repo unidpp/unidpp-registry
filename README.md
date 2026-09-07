@@ -1,10 +1,13 @@
 # unidpp-registry
 
 Part of UniDPP (github.com/unidpp) — implements TODO.impl
-`10-remaining-tasks-definitive.md` item 12: a running **ISO 19135
-registry service** (item registration, versioned supersession,
+`10-remaining-tasks-definitive.md` items 12 (registry service) and 32
+(registry v2: the discovery registry): a running **ISO 19135 registry
+service** (item registration, versioned supersession,
 point-in-time resolution, applicability bindings) that the issuer and
-resolver both consume. License: Apache-2.0.
+resolver both consume, extended with the **discovery registry** —
+signed C3 service descriptors, C4 protocol bindings and C5
+verification mechanisms per PLAN-OPERATORS §1. License: Apache-2.0.
 
 The model mirrors the Ruby reference
 `unidpp-rb/lib/unidpp/registry` (`Item` / `ItemVersion` /
@@ -104,6 +107,111 @@ Each subregister mounts the same surface class-scoped:
 of `data-elements`, `profiles`, `crypto-suites`, `transforms`,
 `trust-anchors`, `units`.
 
+## Discovery registry (v2) — C3 / C4 / C5
+
+The discovery layer registers *descriptors of services and shapes*
+(never records of things — I12): who serves what (C3), in which wire
+grammar (C4), verified by which mechanism (C5). Descriptors are
+**versioned** (the same supersession discipline as 19135 items, with
+derived window ends) and **signed** by the operator key (Ed25519).
+
+| Endpoint | Meaning |
+|---|---|
+| `POST /services` | register a signed C3 service descriptor (`{identifier, version, effective_from?, effective_until?, body, signature}`) |
+| `GET /services?class=&jurisdiction=&at=` | list services, class/jurisdiction filtered, point-in-time |
+| `GET /services/{id}?at=` | one descriptor; `version` is null before its first window |
+| `POST /services/{id}/versions` | supersede with a new signed version (`{version, effective_from?, body, signature, supersede_version?}`) |
+| `GET /services/{id}/supersession?from=` | the supersession chain |
+| `POST /protocol-bindings` | register a signed C4 binding (`{identifier, version, body, signature}`) |
+| `GET /protocol-bindings`, `GET /protocol-bindings/{id}` | list / fetch |
+| `POST /verification-mechanisms` | register a signed C5 mechanism (`{identifier, body, signature}`) |
+| `GET /verification-mechanisms`, `GET /verification-mechanisms/{id}` | list / fetch |
+| `POST /admin/seed` | idempotently populate the seed dataset |
+
+### Schemas (canonical wire forms)
+
+**C3 service body** (signed as a whole, minus the `signature` member):
+
+```json
+{
+  "identifier": "issuer-de-1",
+  "operator": {"id": "op-…", "key_id": "k-…", "public_key": "<64 hex>", "algorithm": "ed25519"},
+  "class": "issuer",
+  "endpoints": [{"uri": "https://issuer.example/", "protocol_binding_ref": "pb-tier-a-binary"}],
+  "protocol_binding_ref": "pb-tier-a-binary",
+  "jurisdiction": "DE",
+  "residency_class": "eu",
+  "status": "active",
+  "succession_pointer": null
+}
+```
+
+Service classes: `issuer`, `registry`, `resolver`, `trust`, `log`,
+`archive`, `gateway`, `marketplace-gate`, `edge`. Service statuses:
+`active`, `superseded`, `suspended`, `succeeded` (`succeeded` is the
+"succession pointer in effect" state — clients follow the pointer).
+
+**C4 protocol-binding body**: `{identifier, description, version,
+grammar_ref, media_types[], conformance_suite_ref?, operator}`.
+
+**C5 verification-mechanism body**: `{identifier, suite,
+agility_status, trust_framework?, trust_list_endpoint?,
+master_list_ref?, verdict_grammar_ref?, operator}`.
+
+### Signature convention
+
+The signature is **Ed25519 over the canonical JSON of the descriptor
+body** (serde_json byte form, with any `signature` member removed
+before signing). The operator id is content-derived from the public
+key (`op-` + 16 hex of `H(b"op" ‖ public_key)`), so an operator id
+pins exactly one key — the registry rejects bodies whose `operator.id`
+does not match the derived id. The signature block is
+`{"key_id": "k-…", "algorithm": "ed25519", "value": "<128 hex>"}`,
+and `key_id` must match the content-derived key id of the operator's
+public key (catches cross-key forgeries).
+
+The **seeded dev keyring** holds the operators UniDPP itself runs
+(`unidpp-registry`, `unidpp-issuer`, `unidpp-resolver`,
+`unidpp-trust`, `unidpp-log`, `unidpp-archive`,
+`unidpp-cli-verifier`, `unidpp-edge`), keys derived as
+`H("UNIDPP-DISCOVERY/OPERATOR-SEED" ‖ label)` — the same scheme as
+signatif's `KeyPair::seeded`. Signatures are verified at intake only;
+journal replay re-applies stored records. Production replaces the
+keyring with an external trust list (the seam is
+`AppState::keyring`).
+
+### Seed dataset (`POST /admin/seed`)
+
+- **8 C3 services** — UniDPP's own: registry, issuer, resolver,
+  trust, log, archive, CLI-class verifier, edge (self-hosted; UniDPP
+  is its own first customer — the reference deployment).
+- **5 C4 protocol bindings** — EN 18222 REST, GS1 Digital Link,
+  GB/T 33993, UNTP VC profile, Tier-A binary.
+- **3 C5 verification mechanisms** — SM2/SM3/SM4 (active), FIPS 186-4
+  (active), FIPS 204 ML-DSA-65 (migration).
+- **10 C1 units** — the SI base units (m, kg, s, A, K, mol, cd) plus
+  kWh, MJ, J, each with an ISO 80000 citation in the manifest
+  (UnitsML-style; submitter ISO/TC 12). Served through the existing
+  `GET /units` subregister.
+
+All seed records go through the same audit log + journal as any other
+mutation; the endpoint is idempotent per process.
+
+### Example session (discovery)
+
+```sh
+# Seed, then discover all trust-class services
+curl -s -XPOST localhost:8090/admin/seed
+curl -s 'localhost:8090/services?class=trust'
+# → one service, its endpoints, protocol binding ref, jurisdiction
+
+# Point-in-time: what did the trust service look like before v2?
+curl -s 'localhost:8090/services/unidpp-trust-v1?at=2026-01-01T00:00:00Z'
+
+# Fetch the binding named by a service descriptor
+curl -s 'localhost:8090/protocol-bindings/pb-tier-a-binary'
+```
+
 ### Example session
 
 ```sh
@@ -151,27 +259,40 @@ rendered on every version, ignored on input).
 | Env var | Default | Meaning |
 |---|---|---|
 | `UNIDPP_REGISTRY_BIND` | `127.0.0.1:8090` | listen address |
-| `UNIDPP_REGISTRY_ADMIN_TOKEN` | unset (open) | Bearer token for mutations and `/admin/log` |
+| `UNIDPP_REGISTRY_ADMIN_TOKEN` | unset (open) | Bearer token for mutations, `/admin/*` and `/admin/seed` |
 | `UNIDPP_REGISTRY_STATE_FILE` | unset (in-memory) | JSONL journal for the audit log (replayed on start) |
+| `UNIDPP_REGISTRY_SEED_ON_DEMAND` | `1` | when `0`, `POST /admin/seed` refuses |
 
 ## Build & test
 
 ```
 cargo build   # zero warnings
-cargo test    # 17 unit + 7 integration tests, zero warnings
+cargo test    # 29 unit + 13 integration tests, zero warnings
+cargo clippy  # clean
 ```
 
 Unit tests cover the model semantics (derived vs. explicit window
 ends, point-in-time resolution, current-version preference,
 supersession chains whole/from-middle/broken, manifest version
-pinning, retroactivity) and the store (lifecycle transitions,
-validation failures, journal round trip). Integration tests speak
-real HTTP against servers spawned on ephemeral ports: register →
-supersede → as-of queries before/during/after windows, supersession
-chains, retroactive applicability (including the `registered_at`
-gate and `effective_until` closure), subregisters class-scoped,
-admin auth (401 wrong/absent token), the append-only audit log
-(order, monotonic seq, payloads) and journal replay across restarts.
+pinning, retroactivity), the store (lifecycle transitions,
+validation failures, journal round trip), and the discovery layer
+(service classes, keyring determinism, signature verify + tamper
+rejection, operator-id pinning, service windows and supersession
+chains, descriptor JSON round trips, body-shape validation).
+Integration tests speak real HTTP against servers spawned on
+ephemeral ports: register → supersede → as-of queries
+before/during/after windows, supersession chains, retroactive
+applicability (including the `registered_at` gate and
+`effective_until` closure), subregisters class-scoped, admin auth
+(401 wrong/absent token), the append-only audit log (order,
+monotonic seq, payloads), journal replay across restarts — and the
+discovery paths: signed service registration (tampered and
+unknown-operator rejections), class/jurisdiction filters, service
+supersession with as-of windows, protocol bindings and verification
+mechanisms (register/list/get/duplicate/missing fields), the seed
+dataset (counts, contents, units with ISO 80000 citations, audit-log
+coverage), discovery journal replay across restarts, and admin auth
+on all new mutation endpoints.
 
 ## Deviations from the Ruby reference (documented)
 

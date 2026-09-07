@@ -26,6 +26,12 @@ use axum::{Extension, Router};
 use serde_json::{json, Map, Value};
 use tokio::net::TcpListener;
 
+use crate::discovery::{
+    key_id as operator_key_id, operator_id as operator_id_of, operator_public_key,
+    operator_record, parse_protocol_body, parse_service_body, parse_verification_body, sign_body,
+    OperatorKeyring, ProtocolBinding, ServiceClass, ServiceDescriptor, ServiceStatus,
+    ServiceVersion, SignatureValue, VerificationMechanism,
+};
 use crate::model::{ApplicabilityBinding, Item, ItemClass, ItemVersion, Status};
 use crate::store::{Store, StoreError};
 use crate::time::Timestamp;
@@ -40,6 +46,12 @@ pub struct Config {
     /// Optional JSONL journal file (append-only audit log, replayed on
     /// start).
     pub state_file: Option<PathBuf>,
+    /// When true, `POST /admin/seed` populates the seed dataset on
+    /// demand (UniDPP's own services + EN 18222 / GS1 DL / GB/T 33993 /
+    /// UNTP / Tier-A binary protocol bindings + SM2 / FIPS / ML-DSA
+    /// verification mechanisms + SI base + kWh / MJ / J units with ISO
+    /// 80000 citations). Defaults to `true`.
+    pub seed_on_demand: bool,
 }
 
 impl Default for Config {
@@ -48,6 +60,7 @@ impl Default for Config {
             bind: "127.0.0.1:8090".parse().unwrap(),
             admin_token: None,
             state_file: None,
+            seed_on_demand: true,
         }
     }
 }
@@ -71,6 +84,9 @@ impl Config {
                 c.state_file = Some(PathBuf::from(path));
             }
         }
+        if let Ok(s) = std::env::var("UNIDPP_REGISTRY_SEED_ON_DEMAND") {
+            c.seed_on_demand = !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off");
+        }
         c
     }
 }
@@ -79,6 +95,13 @@ impl Config {
 pub struct AppState {
     pub config: Config,
     pub store: Mutex<Store>,
+    /// The discovery-layer operator keyring (seeded dev keyring for
+    /// self-hosted deployments; production replaces by an external trust
+    /// list). Mutex-bounded because a future reload path will mutate it.
+    pub keyring: Mutex<OperatorKeyring>,
+    /// `true` once `POST /admin/seed` has populated the seed dataset;
+    /// prevents double-seeding on journal replay.
+    pub seeded: Mutex<bool>,
 }
 
 impl AppState {
@@ -87,6 +110,8 @@ impl AppState {
         Ok(AppState {
             config,
             store: Mutex::new(store),
+            keyring: Mutex::new(OperatorKeyring::seeded_dev()),
+            seeded: Mutex::new(false),
         })
     }
 }
@@ -353,7 +378,7 @@ async fn discovery() -> Result<Response, Response> {
     }
     let doc = json!({
         "service": "unidpp-registry",
-        "description": "UniDPP ISO 19135 register service: item registration, version supersession, point-in-time resolution and applicability bindings",
+        "description": "UniDPP ISO 19135 register service: item registration, version supersession, point-in-time resolution, applicability bindings, and the discovery registry (C3 services, C4 protocol bindings, C5 verification mechanisms)",
         "endpoints": {
             "register_item": "POST /items",
             "list_items": "GET /items?class=&register=&at=",
@@ -362,17 +387,35 @@ async fn discovery() -> Result<Response, Response> {
             "supersession_chain": "GET /items/{id}/supersession?from=",
             "bind_applicability": "POST /applicability",
             "applicability_as_of": "GET /applicability?product_type=&at=",
+            "register_service": "POST /services",
+            "list_services": "GET /services?class=&jurisdiction=&at=",
+            "service_as_of": "GET /services/{id}?at=",
+            "supersede_service": "POST /services/{id}/versions",
+            "service_supersession": "GET /services/{id}/supersession?from=",
+            "register_protocol_binding": "POST /protocol-bindings",
+            "list_protocol_bindings": "GET /protocol-bindings",
+            "protocol_binding": "GET /protocol-bindings/{id}",
+            "register_verification_mechanism": "POST /verification-mechanisms",
+            "list_verification_mechanisms": "GET /verification-mechanisms",
+            "verification_mechanism": "GET /verification-mechanisms/{id}",
             "audit_log": "GET /admin/log?limit=&offset=",
+            "seed": "POST /admin/seed",
             "health": "GET /healthz"
         },
         "item_classes": ItemClass::ALL.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
         "statuses": Status::VALUES.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        "service_classes": ServiceClass::ALL.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+        "service_statuses": ["active", "superseded", "suspended", "succeeded"],
         "subregisters": Value::Object(subregisters),
         "as_of": {
             "query_parameter": "at (alias: asof)",
-            "response_header": "x-as-of",
+            "response_header": "x-as-of"
         },
-        "auth": "mutations require a Bearer token when UNIDPP_REGISTRY_ADMIN_TOKEN is set",
+        "discovery": {
+            "service_descriptor_signature": "Ed25519 over canonical-JSON of body (signature block excluded); operator id is content-derived from the public key",
+            "operator_keyring": "seeded dev keyring: unidpp-{registry,issuer,resolver,trust,log,archive,cli-verifier,edge}; loaded at startup; signatures are verified at intake only (replay re-applies the stored record)"
+        },
+        "auth": "mutations require a Bearer token when UNIDPP_REGISTRY_ADMIN_TOKEN is set"
     });
     Ok(stamped(StatusCode::OK, &doc, Timestamp::now()))
 }
@@ -432,7 +475,9 @@ async fn create_item(
     let effective_until = opt_ts(&v, "effective_until")?;
     if let Some(until) = effective_until {
         if until <= effective_from {
-            return Err(bad_request("`effective_until` must be after `effective_from`"));
+            return Err(bad_request(
+                "`effective_until` must be after `effective_from`",
+            ));
         }
     }
     let manifest = opt_object(&v, "manifest")?;
@@ -552,7 +597,9 @@ async fn supersede_item(
     let effective_until = opt_ts(&v, "effective_until")?;
     if let Some(until) = effective_until {
         if until <= effective_from {
-            return Err(bad_request("`effective_until` must be after `effective_from`"));
+            return Err(bad_request(
+                "`effective_until` must be after `effective_from`",
+            ));
         }
     }
     let manifest = opt_object(&v, "manifest")?;
@@ -601,7 +648,9 @@ async fn supersede_item(
         (rec.seq, after, target)
     };
     let (audit_seq, after, target) = outcome;
-    let new_version = after.version(&version_number).expect("successor registered");
+    let new_version = after
+        .version(&version_number)
+        .expect("successor registered");
     let old_version = after.version(&target).expect("target retained");
     let body = json!({
         "identifier": identifier,
@@ -677,7 +726,9 @@ async fn bind_applicability(
     let effective_until = opt_ts(&v, "effective_until")?;
     if let Some(until) = effective_until {
         if until <= effective_from {
-            return Err(bad_request("`effective_until` must be after `effective_from`"));
+            return Err(bad_request(
+                "`effective_until` must be after `effective_from`",
+            ));
         }
     }
     let retroactive = opt_bool(&v, "retroactive")?.unwrap_or(false);
@@ -767,6 +818,901 @@ async fn admin_log(
         store.log_json(limit, offset)
     };
     Ok(stamped(StatusCode::OK, &view, Timestamp::now()))
+}
+
+// ---------------------------------------------------------------------------
+// Discovery handlers (C3 services, C4 protocol bindings, C5 verification
+// mechanisms). Mutations verify the descriptor signature against the
+// operator keyring first; the verified record is then recorded in the
+// audit log + journal.
+// ---------------------------------------------------------------------------
+
+/// Translate a `DiscoveryError` into an HTTP response (400). Discovery
+/// errors never leak server state — they describe what the caller's
+/// descriptor did wrong.
+fn discovery_error(e: crate::discovery::DiscoveryError) -> Response {
+    bad_request(&e.to_string())
+}
+
+/// `POST /services` — register a signed C3 service descriptor.
+async fn create_service(
+    State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<Response, Response> {
+    if let Some(deny) = require_admin(&app, &headers) {
+        return Ok(deny);
+    }
+    let v = parse_body(&body)?;
+    let identifier = req_str(&v, "identifier")?.trim().to_string();
+    validate_token(&identifier, "identifier")?;
+    let version = req_str(&v, "version")?.trim().to_string();
+    validate_token(&version, "version")?;
+    let body_val = v
+        .get("body")
+        .cloned()
+        .ok_or_else(|| bad_request("missing `body`"))?;
+    let signature = v
+        .get("signature")
+        .ok_or_else(|| bad_request("missing `signature`"))
+        .and_then(|s| {
+            SignatureValue::from_json(s).map_err(|e| bad_request(&format!("`signature`: {e}")))
+        })?;
+    let effective_from = opt_ts(&v, "effective_from")?.unwrap_or_else(Timestamp::now);
+    let effective_until = opt_ts(&v, "effective_until")?;
+    if let Some(until) = effective_until {
+        if until <= effective_from {
+            return Err(bad_request("`effective_until` must be after `effective_from`"));
+        }
+    }
+    let parsed = parse_service_body(&body_val, &identifier).map_err(discovery_error)?;
+    {
+        let kr = app.keyring.lock().expect("keyring poisoned");
+        // Signature is over canonical-JSON of body with `signature` removed.
+        let mut signed_body = body_val.clone();
+        if let Some(o) = signed_body.as_object_mut() {
+            o.remove("signature");
+        }
+        let payload = serde_json::to_vec(&signed_body)
+            .map_err(|e| bad_request(&format!("serialize body: {e}")))?;
+        kr.verify(&parsed.operator.id, &payload, &signature.value)
+            .map_err(discovery_error)?;
+        // The key id in the signature must match the content-derived key
+        // id of the operator's public key (catches cross-key forgeries).
+        let expected_key_id = operator_key_id(&parsed.operator.public_key);
+        if signature.key_id != expected_key_id {
+            return Err(bad_request(&format!(
+                "signature `key_id` `{}` does not match the content-derived key id `{}` for operator `{}`",
+                signature.key_id, expected_key_id, parsed.operator.id
+            )));
+        }
+    }
+    let now = Timestamp::now();
+    let svc_version = ServiceVersion {
+        version,
+        status: parsed.status,
+        effective_from,
+        effective_until,
+        registered_at: now,
+        superseded_by_version: None,
+        body: body_val,
+        signature,
+    };
+    let audit_seq = {
+        let mut store = app.store.lock().expect("store poisoned");
+        store
+            .register_service(ServiceDescriptor {
+                identifier: identifier.clone(),
+                versions: vec![svc_version.clone()],
+            })
+            .map_err(store_error)?
+            .seq
+    };
+    let body = json!({
+        "identifier": identifier,
+        "version": svc_version.to_json(None),
+        "audit_seq": audit_seq,
+        "as_of": now.to_string(),
+    });
+    Ok(stamped(StatusCode::CREATED, &body, now))
+}
+
+/// `GET /services` — list services with optional `class=` and
+/// `jurisdiction=` filters and `at=` point-in-time semantics.
+async fn list_services(
+    State(app): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Response, Response> {
+    let at = parse_at(&params)?;
+    let as_of = at.unwrap_or_else(Timestamp::now);
+    let class_filter = match opt_query(&params, "class") {
+        None => None,
+        Some(s) => Some(ServiceClass::parse(&s).ok_or_else(|| {
+            bad_request(&format!(
+                "unknown service class `{s}` (expected one of {})",
+                ServiceClass::help()
+            ))
+        })?),
+    };
+    let jurisdiction_filter = opt_query(&params, "jurisdiction");
+    let services: Vec<ServiceDescriptor> = {
+        let store = app.store.lock().expect("store poisoned");
+        store
+            .services_filtered(class_filter, jurisdiction_filter.as_deref())
+            .into_iter()
+            .cloned()
+            .collect()
+    };
+    let items: Vec<Value> = services
+        .into_iter()
+        .map(|s| s.to_json(as_of, at))
+        .collect();
+    Ok(stamped(
+        StatusCode::OK,
+        &json!({"as_of": as_of.to_string(), "count": items.len(), "services": items}),
+        as_of,
+    ))
+}
+
+/// `GET /services/{id}` — a single service descriptor with the version
+/// in force at `at`.
+async fn get_service(
+    State(app): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+    Path(identifier): Path<String>,
+) -> Result<Response, Response> {
+    let at = parse_at(&params)?;
+    let as_of = at.unwrap_or_else(Timestamp::now);
+    let svc = {
+        let store = app.store.lock().expect("store poisoned");
+        store.service(&identifier).cloned()
+    };
+    let Some(svc) = svc else {
+        return Err(not_found(&format!("no service descriptor `{identifier}`")));
+    };
+    Ok(stamped(StatusCode::OK, &svc.to_json(as_of, at), as_of))
+}
+
+/// `POST /services/{id}/versions` — supersede a service descriptor
+/// with a new signed version.
+async fn supersede_service(
+    State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(identifier): Path<String>,
+    body: String,
+) -> Result<Response, Response> {
+    if let Some(deny) = require_admin(&app, &headers) {
+        return Ok(deny);
+    }
+    // Existence first: an unknown service is a 404 regardless of what
+    // the body says (the item handler's convention).
+    {
+        let store = app.store.lock().expect("store poisoned");
+        if store.service(&identifier).is_none() {
+            return Err(not_found(&format!("no service descriptor `{identifier}`")));
+        }
+    }
+    let v = parse_body(&body)?;
+    let version = req_str(&v, "version")?.trim().to_string();
+    validate_token(&version, "version")?;
+    let body_val = v
+        .get("body")
+        .cloned()
+        .ok_or_else(|| bad_request("missing `body`"))?;
+    let signature = v
+        .get("signature")
+        .ok_or_else(|| bad_request("missing `signature`"))
+        .and_then(|s| {
+            SignatureValue::from_json(s).map_err(|e| bad_request(&format!("`signature`: {e}")))
+        })?;
+    let effective_from = opt_ts(&v, "effective_from")?.unwrap_or_else(Timestamp::now);
+    let effective_until = opt_ts(&v, "effective_until")?;
+    if let Some(until) = effective_until {
+        if until <= effective_from {
+            return Err(bad_request("`effective_until` must be after `effective_from`"));
+        }
+    }
+    let parsed = parse_service_body(&body_val, &identifier).map_err(discovery_error)?;
+    {
+        let kr = app.keyring.lock().expect("keyring poisoned");
+        let mut signed_body = body_val.clone();
+        if let Some(o) = signed_body.as_object_mut() {
+            o.remove("signature");
+        }
+        let payload = serde_json::to_vec(&signed_body)
+            .map_err(|e| bad_request(&format!("serialize body: {e}")))?;
+        kr.verify(&parsed.operator.id, &payload, &signature.value)
+            .map_err(discovery_error)?;
+        let expected_key_id = operator_key_id(&parsed.operator.public_key);
+        if signature.key_id != expected_key_id {
+            return Err(bad_request(&format!(
+                "signature `key_id` `{}` does not match the content-derived key id `{}`",
+                signature.key_id, expected_key_id
+            )));
+        }
+    }
+    let now = Timestamp::now();
+    let successor = ServiceVersion {
+        version,
+        status: parsed.status,
+        effective_from,
+        effective_until,
+        registered_at: now,
+        superseded_by_version: None,
+        body: body_val,
+        signature,
+    };
+    let target = match opt_str(&v, "supersede_version")? {
+        Some(explicit) => explicit,
+        None => {
+            let current = {
+                let store = app.store.lock().expect("store poisoned");
+                let svc = store
+                    .service(&identifier)
+                    .ok_or_else(|| not_found(&format!("no service descriptor `{identifier}`")))?;
+                svc.current_version().map(|v| v.version.clone())
+            };
+            current.ok_or_else(|| {
+                bad_request(&format!(
+                    "service `{identifier}` has no active version to supersede"
+                ))
+            })?
+        }
+    };
+    {
+        let store = app.store.lock().expect("store poisoned");
+        if store.service(&identifier).is_none() {
+            return Err(not_found(&format!("no service descriptor `{identifier}`")));
+        }
+    }
+    let outcome = {
+        let mut store = app.store.lock().expect("store poisoned");
+        let rec = store
+            .supersede_service(&identifier, &target, successor.clone())
+            .map_err(store_error)?;
+        let after = store
+            .service(&identifier)
+            .cloned()
+            .expect("service exists after supersede");
+        (rec.seq, after, target)
+    };
+    let (audit_seq, after, target) = outcome;
+    let body = json!({
+        "identifier": identifier,
+        "new_version": after
+            .version(&successor.version)
+            .map(|v| v.to_json(after.window_until(v))),
+        "superseded_version": after
+            .version(&target)
+            .map(|v| v.to_json(after.window_until(v))),
+        "audit_seq": audit_seq,
+        "as_of": now.to_string(),
+    });
+    Ok(stamped(StatusCode::CREATED, &body, now))
+}
+
+/// `GET /services/{id}/supersession` — the supersession chain for a
+/// service descriptor.
+async fn service_chain(
+    State(app): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+    Path(identifier): Path<String>,
+) -> Result<Response, Response> {
+    let at = parse_at(&params)?;
+    let as_of = at.unwrap_or_else(Timestamp::now);
+    let from = opt_query(&params, "from");
+    let svc = {
+        let store = app.store.lock().expect("store poisoned");
+        store.service(&identifier).cloned()
+    };
+    let Some(svc) = svc else {
+        return Err(not_found(&format!("no service descriptor `{identifier}`")));
+    };
+    let chain = svc
+        .supersession_chain(from.as_deref())
+        .map_err(|e| bad_request(&e))?;
+    let rendered: Vec<Value> = chain
+        .iter()
+        .map(|v| v.to_json(svc.window_until(v)))
+        .collect();
+    let terminal = rendered.last().cloned().unwrap_or(Value::Null);
+    Ok(stamped(
+        StatusCode::OK,
+        &json!({
+            "identifier": identifier,
+            "chain": rendered,
+            "terminal": terminal,
+            "as_of": as_of.to_string()
+        }),
+        as_of,
+    ))
+}
+
+/// `POST /protocol-bindings` — register a signed C4 protocol binding.
+async fn create_protocol_binding(
+    State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<Response, Response> {
+    if let Some(deny) = require_admin(&app, &headers) {
+        return Ok(deny);
+    }
+    let v = parse_body(&body)?;
+    let identifier = req_str(&v, "identifier")?.trim().to_string();
+    validate_token(&identifier, "identifier")?;
+    let version = req_str(&v, "version")?.trim().to_string();
+    validate_token(&version, "version")?;
+    let body_val = v
+        .get("body")
+        .cloned()
+        .ok_or_else(|| bad_request("missing `body`"))?;
+    let signature = v
+        .get("signature")
+        .ok_or_else(|| bad_request("missing `signature`"))
+        .and_then(|s| {
+            SignatureValue::from_json(s).map_err(|e| bad_request(&format!("`signature`: {e}")))
+        })?;
+    let parsed = parse_protocol_body(&body_val).map_err(discovery_error)?;
+    let operator_val = body_val
+        .get("operator")
+        .ok_or_else(|| bad_request("body missing `operator`"))
+        .and_then(|o| {
+            crate::discovery::OperatorRef::from_json(o)
+                .map_err(|e| bad_request(&format!("`operator`: {e}")))
+        })?;
+    {
+        let kr = app.keyring.lock().expect("keyring poisoned");
+        // The signature is over the canonical body (with any `signature`
+        // block removed) — the same convention as services.
+        let payload = {
+            let mut b = body_val.clone();
+            if let Some(o) = b.as_object_mut() {
+                o.remove("signature");
+            }
+            serde_json::to_vec(&b).map_err(|e| bad_request(&format!("serialize body: {e}")))?
+        };
+        kr.verify(&operator_val.id, &payload, &signature.value)
+            .map_err(discovery_error)?;
+    }
+    let binding = ProtocolBinding {
+        identifier: identifier.clone(),
+        grammar_ref: parsed.grammar_ref,
+        media_types: parsed.media_types,
+        version,
+        conformance_suite_ref: parsed.conformance_suite_ref,
+        body: body_val,
+        signature,
+    };
+    let audit_seq = {
+        let mut store = app.store.lock().expect("store poisoned");
+        store
+            .register_protocol_binding(binding.clone())
+            .map_err(store_error)?
+            .seq
+    };
+    let body = json!({
+        "identifier": identifier,
+        "binding": binding.to_json(),
+        "audit_seq": audit_seq,
+        "as_of": Timestamp::now().to_string(),
+    });
+    Ok(stamped(StatusCode::CREATED, &body, Timestamp::now()))
+}
+
+/// `GET /protocol-bindings` — list all registered protocol bindings.
+async fn list_protocol_bindings(
+    State(app): State<Arc<AppState>>,
+) -> Result<Response, Response> {
+    let as_of = Timestamp::now();
+    let bindings: Vec<ProtocolBinding> = {
+        let store = app.store.lock().expect("store poisoned");
+        store.protocol_bindings_all().into_iter().cloned().collect()
+    };
+    let items: Vec<Value> = bindings.into_iter().map(|b| b.to_json()).collect();
+    Ok(stamped(
+        StatusCode::OK,
+        &json!({
+            "as_of": as_of.to_string(),
+            "count": items.len(),
+            "protocol_bindings": items
+        }),
+        as_of,
+    ))
+}
+
+/// `GET /protocol-bindings/{id}` — a single protocol binding.
+async fn get_protocol_binding(
+    State(app): State<Arc<AppState>>,
+    Path(identifier): Path<String>,
+) -> Result<Response, Response> {
+    let as_of = Timestamp::now();
+    let binding = {
+        let store = app.store.lock().expect("store poisoned");
+        store.protocol_binding(&identifier).cloned()
+    };
+    let Some(binding) = binding else {
+        return Err(not_found(&format!("no protocol binding `{identifier}`")));
+    };
+    Ok(stamped(StatusCode::OK, &binding.to_json(), as_of))
+}
+
+/// `POST /verification-mechanisms` — register a signed C5 verification
+/// mechanism.
+async fn create_verification_mechanism(
+    State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<Response, Response> {
+    if let Some(deny) = require_admin(&app, &headers) {
+        return Ok(deny);
+    }
+    let v = parse_body(&body)?;
+    let identifier = req_str(&v, "identifier")?.trim().to_string();
+    validate_token(&identifier, "identifier")?;
+    let body_val = v
+        .get("body")
+        .cloned()
+        .ok_or_else(|| bad_request("missing `body`"))?;
+    let signature = v
+        .get("signature")
+        .ok_or_else(|| bad_request("missing `signature`"))
+        .and_then(|s| {
+            SignatureValue::from_json(s).map_err(|e| bad_request(&format!("`signature`: {e}")))
+        })?;
+    let parsed = parse_verification_body(&body_val).map_err(discovery_error)?;
+    let operator_val = body_val
+        .get("operator")
+        .ok_or_else(|| bad_request("body missing `operator`"))
+        .and_then(|o| {
+            crate::discovery::OperatorRef::from_json(o)
+                .map_err(|e| bad_request(&format!("`operator`: {e}")))
+        })?;
+    {
+        let kr = app.keyring.lock().expect("keyring poisoned");
+        // The signature is over the canonical body (with any `signature`
+        // block removed) — the same convention as services.
+        let payload = {
+            let mut b = body_val.clone();
+            if let Some(o) = b.as_object_mut() {
+                o.remove("signature");
+            }
+            serde_json::to_vec(&b).map_err(|e| bad_request(&format!("serialize body: {e}")))?
+        };
+        kr.verify(&operator_val.id, &payload, &signature.value)
+            .map_err(discovery_error)?;
+    }
+    let mechanism = VerificationMechanism {
+        identifier: identifier.clone(),
+        suite: parsed.suite,
+        agility_status: parsed.agility_status,
+        trust_framework: parsed.trust_framework,
+        trust_list_endpoint: parsed.trust_list_endpoint,
+        master_list_ref: parsed.master_list_ref,
+        verdict_grammar_ref: parsed.verdict_grammar_ref,
+        body: body_val,
+        signature,
+    };
+    let audit_seq = {
+        let mut store = app.store.lock().expect("store poisoned");
+        store
+            .register_verification_mechanism(mechanism.clone())
+            .map_err(store_error)?
+            .seq
+    };
+    let body = json!({
+        "identifier": identifier,
+        "mechanism": mechanism.to_json(),
+        "audit_seq": audit_seq,
+        "as_of": Timestamp::now().to_string(),
+    });
+    Ok(stamped(StatusCode::CREATED, &body, Timestamp::now()))
+}
+
+/// `GET /verification-mechanisms` — list all registered verification
+/// mechanisms.
+async fn list_verification_mechanisms(
+    State(app): State<Arc<AppState>>,
+) -> Result<Response, Response> {
+    let as_of = Timestamp::now();
+    let mechanisms: Vec<VerificationMechanism> = {
+        let store = app.store.lock().expect("store poisoned");
+        store
+            .verification_mechanisms_all()
+            .into_iter()
+            .cloned()
+            .collect()
+    };
+    let items: Vec<Value> = mechanisms.into_iter().map(|m| m.to_json()).collect();
+    Ok(stamped(
+        StatusCode::OK,
+        &json!({
+            "as_of": as_of.to_string(),
+            "count": items.len(),
+            "verification_mechanisms": items
+        }),
+        as_of,
+    ))
+}
+
+/// `GET /verification-mechanisms/{id}` — a single verification
+/// mechanism.
+async fn get_verification_mechanism(
+    State(app): State<Arc<AppState>>,
+    Path(identifier): Path<String>,
+) -> Result<Response, Response> {
+    let as_of = Timestamp::now();
+    let mech = {
+        let store = app.store.lock().expect("store poisoned");
+        store.verification_mechanism(&identifier).cloned()
+    };
+    let Some(mech) = mech else {
+        return Err(not_found(&format!(
+            "no verification mechanism `{identifier}`"
+        )));
+    };
+    Ok(stamped(StatusCode::OK, &mech.to_json(), as_of))
+}
+
+// ---------------------------------------------------------------------------
+// Seed endpoint (admin) — populates the seed dataset: our own services,
+// protocol bindings, verification mechanisms, and units (ISO 80000-
+// cited SI base + kWh / MJ / J).
+// ---------------------------------------------------------------------------
+
+/// `POST /admin/seed` — idempotent: populates the seed dataset only once
+/// per process (or until the journal is wiped). Returns a summary of
+/// counts registered. Disabled with `UNIDPP_REGISTRY_SEED_ON_DEMAND=0`.
+async fn admin_seed(
+    State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response, Response> {
+    if let Some(deny) = require_admin(&app, &headers) {
+        return Ok(deny);
+    }
+    if !app.config.seed_on_demand {
+        return Err(bad_request(
+            "seeding is disabled (UNIDPP_REGISTRY_SEED_ON_DEMAND=0)",
+        ));
+    }
+    {
+        let already = *app.seeded.lock().expect("seeded poisoned");
+        if already {
+            return Ok(stamped(
+                StatusCode::OK,
+                &json!({"status": "already-seeded"}),
+                Timestamp::now(),
+            ));
+        }
+    }
+    let report = run_seed(&app).map_err(|e| bad_request(&format!("seed failed: {e}")))?;
+    {
+        let mut flag = app.seeded.lock().expect("seeded poisoned");
+        *flag = true;
+    }
+    Ok(stamped(StatusCode::OK, &report, Timestamp::now()))
+}
+
+/// The seed routine — populates the discovery layer + the units
+/// subregister with the dataset named in the task. Returns a JSON
+/// summary; on a partial failure no records are committed (the journal
+/// is not written until each record passes through `Store::record`).
+fn run_seed(app: &Arc<AppState>) -> Result<Value, String> {
+    let mut counts = json!({
+        "services": 0,
+        "protocol_bindings": 0,
+        "verification_mechanisms": 0,
+        "units": 0
+    });
+
+    // ---- Units (C1 subregister: SI base + kWh/MJ/J with ISO 80000
+    // citations) -------------------------------------------------------
+    let units = [
+        ("unit-m", "metre", "ISO 80000-3:2006"),
+        ("unit-kg", "kilogram", "ISO 80000-4:2006"),
+        ("unit-s", "second", "ISO 80000-3:2006"),
+        ("unit-a", "ampere", "ISO 80000-6:2006"),
+        ("unit-k", "kelvin", "ISO 80000-5:2007"),
+        ("unit-mol", "mole", "ISO 80000-9:2009"),
+        ("unit-cd", "candela", "ISO 80000-7:2008"),
+        ("unit-kwh", "kilowatt hour", "ISO 80000-4:2006 (energy); 1 kWh = 3.6 MJ exactly"),
+        ("unit-mj", "megajoule", "ISO 80000-4:2006 (energy)"),
+        ("unit-j", "joule", "ISO 80000-4:2006 (energy)"),
+    ];
+    for (id, name, citation) in units {
+        let item = Item {
+            identifier: id.to_string(),
+            register: "unidpp-seed".to_string(),
+            item_class: ItemClass::Unit,
+            title: name.to_string(),
+            submitting_organization: Some("ISO/TC 12".to_string()),
+            versions: vec![ItemVersion {
+                version: "1.0.0".to_string(),
+                status: Status::Valid,
+                effective_from: Some(Timestamp::parse("2026-01-01T00:00:00Z").unwrap()),
+                effective_until: None,
+                registered_at: Some(Timestamp::now()),
+                superseded_by_version: None,
+                notes: Some(citation.to_string()),
+            }],
+            manifest: Some(json!({
+                "version": "1.0.0",
+                "name": name,
+                "iso_80000_citation": citation
+            })),
+        };
+        let mut store = app.store.lock().expect("store poisoned");
+        store
+            .register_item(item)
+            .map_err(|e| format!("seed unit `{id}`: {e:?}"))?;
+        counts["units"] = json!(counts["units"].as_u64().unwrap() + 1);
+    }
+    drop(app.store.lock());
+
+    // ---- Protocol bindings (C4) --------------------------------------
+    // Each binding carries a signed body authored by its owning operator.
+    // For seed descriptors authored by UniDPP itself, the operator is
+    // `unidpp-registry` (the registry is itself the meta-descriptor).
+    let protocol_bindings = seed_protocol_bindings();
+    for (label, pb) in protocol_bindings {
+        let mut store = app.store.lock().expect("store poisoned");
+        store
+            .register_protocol_binding(pb)
+            .map_err(|e| format!("seed protocol binding `{label}`: {e:?}"))?;
+        counts["protocol_bindings"] = json!(counts["protocol_bindings"].as_u64().unwrap() + 1);
+    }
+    drop(app.store.lock());
+
+    // ---- Verification mechanisms (C5) --------------------------------
+    let verification_mechanisms = seed_verification_mechanisms();
+    for (label, mech) in verification_mechanisms {
+        let mut store = app.store.lock().expect("store poisoned");
+        store
+            .register_verification_mechanism(mech)
+            .map_err(|e| format!("seed verification mechanism `{label}`: {e:?}"))?;
+        counts["verification_mechanisms"] = json!(
+            counts["verification_mechanisms"].as_u64().unwrap() + 1
+        );
+    }
+    drop(app.store.lock());
+
+    // ---- Services (C3) ------------------------------------------------
+    let services = seed_services();
+    for (label, svc) in services {
+        // sign and register the first version only (supersession is the
+        // operator's prerogative; seeds don't pre-populate successors).
+        let mut store = app.store.lock().expect("store poisoned");
+        store
+            .register_service(svc)
+            .map_err(|e| format!("seed service `{label}`: {e:?}"))?;
+        counts["services"] = json!(counts["services"].as_u64().unwrap() + 1);
+    }
+    drop(app.store.lock());
+
+    Ok(json!({
+        "status": "seeded",
+        "counts": counts,
+    }))
+}
+
+/// One seed protocol-binding specification (C4).
+struct SeedProtocol {
+    id: &'static str,
+    description: &'static str,
+    grammar_ref: &'static str,
+    media_types: Vec<&'static str>,
+    conformance_suite_ref: Option<&'static str>,
+}
+
+/// Build the seed protocol-binding set: EN 18222 REST, GS1 DL URI,
+/// GB/T 33993, UNTP VC profile, Tier-A binary grammar. All signed by
+/// the `unidpp-registry` operator.
+fn seed_protocol_bindings() -> Vec<(String, ProtocolBinding)> {
+    let entries = [
+        SeedProtocol {
+            id: "pb-en18222-rest",
+            description: "EN 18222:2026 REST resource model",
+            grammar_ref: "https://standards.cen-cenelec.eu/EN-18222",
+            media_types: vec!["application/vnd.en18222+json"],
+            conformance_suite_ref: Some("https://standards.cen-cenelec.eu/EN-18222/conformance"),
+        },
+        SeedProtocol {
+            id: "pb-gs1-digital-link",
+            description: "GS1 Digital Link URI grammar (v1.2)",
+            grammar_ref: "https://www.gs1.org/standards/gs1-digital-link",
+            media_types: vec!["application/gs1dl+json"],
+            conformance_suite_ref: Some("https://www.gs1.org/standards/gs1-digital-link/conformance"),
+        },
+        SeedProtocol {
+            id: "pb-gbt-33993",
+            description: "GB/T 33993 DPP wrapper envelope",
+            grammar_ref: "https://openstd.samr.gov.cn/GB/T-33993",
+            media_types: vec!["application/vnd.gbt33993+json"],
+            conformance_suite_ref: Some("https://openstd.samr.gov.cn/GB/T-33993/conformance"),
+        },
+        SeedProtocol {
+            id: "pb-untp-vc",
+            description: "UN Transparency Protocol Verifiable Credential profile",
+            grammar_ref: "https://uncefact.unece.org/untp",
+            media_types: vec!["application/vc+json", "application/vp+json"],
+            conformance_suite_ref: Some("https://uncefact.unece.org/untp/conformance"),
+        },
+        SeedProtocol {
+            id: "pb-tier-a-binary",
+            description: "UniDPP Tier-A signed binary pack",
+            grammar_ref: "https://unidpp.org/spec/tier-a-binary",
+            media_types: vec!["application/vnd.unidpp.tier-a"],
+            conformance_suite_ref: Some("https://unidpp.org/spec/tier-a-binary/conformance"),
+        },
+    ];
+    let pk = operator_public_key("unidpp-registry");
+    let op = operator_record("unidpp-registry");
+    let key_id_str = operator_key_id(&pk);
+    let op_id_str = operator_id_of(&pk);
+    entries
+        .into_iter()
+        .map(|e| {
+            // The signed envelope is the canonical wire shape (the same
+            // object `ProtocolBinding::to_json` reproduces minus the
+            // signature block).
+            let mut wire = json!({
+                "identifier": e.id,
+                "description": e.description,
+                "version": "1.0.0",
+                "grammar_ref": e.grammar_ref,
+                "media_types": e.media_types,
+                "conformance_suite_ref": e.conformance_suite_ref,
+                "operator": op.clone(),
+            });
+            sign_body(&mut wire, "unidpp-registry", &op_id_str, &key_id_str)
+                .expect("sign protocol binding");
+            let signature =
+                SignatureValue::from_json(&wire["signature"]).expect("signature parse");
+            let parsed = parse_protocol_body(&wire).expect("parse body");
+            (
+                e.id.to_string(),
+                ProtocolBinding {
+                    identifier: e.id.to_string(),
+                    grammar_ref: parsed.grammar_ref,
+                    media_types: parsed.media_types,
+                    version: "1.0.0".to_string(),
+                    conformance_suite_ref: parsed.conformance_suite_ref,
+                    body: wire,
+                    signature,
+                },
+            )
+        })
+        .collect()
+}
+
+/// One seed verification-mechanism specification (C5).
+struct SeedMechanism {
+    id: &'static str,
+    suite: &'static str,
+    agility_status: &'static str,
+    trust_list_endpoint: &'static str,
+}
+
+/// Build the seed verification-mechanism set: SM2/SM3/SM4, FIPS 186-4
+/// with FIPS 204 (ML-DSA), and the SIGNATIF trust framework as the
+/// trust-graph reference.
+fn seed_verification_mechanisms() -> Vec<(String, VerificationMechanism)> {
+    let entries = [
+        SeedMechanism {
+            id: "vm-sm2-sm3-sm4",
+            suite: "SM2-SM3-SM4",
+            agility_status: "active",
+            trust_list_endpoint: "https://trust.unidpp.org/sm2-list",
+        },
+        SeedMechanism {
+            id: "vm-fips",
+            suite: "FIPS 186-4 (ECDSA-P256 + RSA-PSS)",
+            agility_status: "active",
+            trust_list_endpoint: "https://trust.unidpp.org/fips-list",
+        },
+        SeedMechanism {
+            id: "vm-ml-dsa",
+            suite: "FIPS 204 ML-DSA-65 (migration phase)",
+            agility_status: "migration",
+            trust_list_endpoint: "https://trust.unidpp.org/pq-list",
+        },
+    ];
+    let pk = operator_public_key("unidpp-registry");
+    let op = operator_record("unidpp-registry");
+    let key_id_str = operator_key_id(&pk);
+    let op_id_str = operator_id_of(&pk);
+    entries
+        .into_iter()
+        .map(|e| {
+            let mut wire = json!({
+                "identifier": e.id,
+                "suite": e.suite,
+                "agility_status": e.agility_status,
+                "trust_framework": "SIGNATIF",
+                "trust_list_endpoint": e.trust_list_endpoint,
+                "master_list_ref": "https://unidpp.org/spec/signatif/master-list",
+                "operator": op.clone(),
+            });
+            sign_body(&mut wire, "unidpp-registry", &op_id_str, &key_id_str)
+                .expect("sign verification mechanism");
+            let signature =
+                SignatureValue::from_json(&wire["signature"]).expect("signature parse");
+            let parsed = parse_verification_body(&wire).expect("parse body");
+            (
+                e.id.to_string(),
+                VerificationMechanism {
+                    identifier: e.id.to_string(),
+                    suite: parsed.suite,
+                    agility_status: parsed.agility_status,
+                    trust_framework: parsed.trust_framework,
+                    trust_list_endpoint: parsed.trust_list_endpoint,
+                    master_list_ref: parsed.master_list_ref,
+                    verdict_grammar_ref: parsed.verdict_grammar_ref,
+                    body: wire,
+                    signature,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Build the seed service set: the services UniDPP itself runs
+/// (registry, issuer, resolver, trust, log, archive, CLI-class
+/// verifier, edge). Each is signed by its own operator.
+fn seed_services() -> Vec<(String, ServiceDescriptor)> {
+    let now = Timestamp::now();
+    let eff = Timestamp::parse("2026-09-01T00:00:00Z").unwrap();
+    let operators = [
+        ("unidpp-registry", ServiceClass::Registry),
+        ("unidpp-issuer", ServiceClass::Issuer),
+        ("unidpp-resolver", ServiceClass::Resolver),
+        ("unidpp-trust", ServiceClass::Trust),
+        ("unidpp-log", ServiceClass::Log),
+        ("unidpp-archive", ServiceClass::Archive),
+        ("unidpp-cli-verifier", ServiceClass::Edge),
+        ("unidpp-edge", ServiceClass::Edge),
+    ];
+    operators
+        .into_iter()
+        .map(|(label, class)| {
+            let identifier = format!("{label}-v1");
+            let pk = crate::discovery::operator_public_key(label);
+            let key_id_str = operator_key_id(&pk);
+            let op_id_str = operator_id_of(&pk);
+            let uri = format!("https://{label}.unidpp.org/");
+            let mut body = json!({
+                "identifier": identifier,
+                "operator": crate::discovery::operator_record(label),
+                "class": class.as_str(),
+                "endpoints": [{"uri": uri, "protocol_binding_ref": "pb-tier-a-binary"}],
+                "protocol_binding_ref": "pb-tier-a-binary",
+                "jurisdiction": "ZZ",
+                "residency_class": "anywhere",
+                "status": "active",
+                "version": "1.0.0",
+                "effective_from": eff.to_string(),
+            });
+            sign_body(&mut body, label, &op_id_str, &key_id_str)
+                .expect("sign service body");
+            let signature = SignatureValue::from_json(&body["signature"]).expect("sig parse");
+            let version = ServiceVersion {
+                version: "1.0.0".to_string(),
+                status: ServiceStatus::Active,
+                effective_from: eff,
+                effective_until: None,
+                registered_at: now,
+                superseded_by_version: None,
+                body,
+                signature,
+            };
+            (
+                identifier.clone(),
+                ServiceDescriptor {
+                    identifier,
+                    versions: vec![version],
+                },
+            )
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -882,11 +1828,35 @@ pub fn router(app: Arc<AppState>) -> Router {
         .route("/items/{id}", get(get_one_item))
         .route("/items/{id}/versions", post(supersede_one_item))
         .route("/items/{id}/supersession", get(one_item_chain))
-        .route("/applicability", get(applicability_query).post(bind_applicability))
+        .route(
+            "/applicability",
+            get(applicability_query).post(bind_applicability),
+        )
+        .route("/services", get(list_services).post(create_service))
+        .route("/services/{id}", get(get_service))
+        .route("/services/{id}/versions", post(supersede_service))
+        .route("/services/{id}/supersession", get(service_chain))
+        .route(
+            "/protocol-bindings",
+            get(list_protocol_bindings).post(create_protocol_binding),
+        )
+        .route("/protocol-bindings/{id}", get(get_protocol_binding))
+        .route(
+            "/verification-mechanisms",
+            get(list_verification_mechanisms).post(create_verification_mechanism),
+        )
+        .route(
+            "/verification-mechanisms/{id}",
+            get(get_verification_mechanism),
+        )
         .route("/admin/log", get(admin_log))
+        .route("/admin/seed", post(admin_seed))
         .with_state(app.clone());
     for class in ItemClass::ALL {
-        r = r.nest(&format!("/{}", class.plural()), subregister(app.clone(), class));
+        r = r.nest(
+            &format!("/{}", class.plural()),
+            subregister(app.clone(), class),
+        );
     }
     r
 }

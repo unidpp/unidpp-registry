@@ -33,11 +33,17 @@
 #![allow(clippy::result_large_err)]
 
 pub mod api;
+pub mod discovery;
 pub mod model;
 pub mod store;
 pub mod time;
 
 pub use api::{run, Config, TestServer};
+pub use discovery::{
+    key_id, operator_id, operator_public_key, operator_record, sign_body, DiscoveryError,
+    Endpoint, OperatorKeyring, OperatorRef, ProtocolBinding, ServiceClass, ServiceDescriptor,
+    ServiceStatus, ServiceVersion, SignatureValue, VerificationMechanism,
+};
 pub use model::{ApplicabilityBinding, Item, ItemClass, ItemVersion, Status};
 pub use store::{AuditRecord, Op, Store, StoreError};
 pub use time::Timestamp;

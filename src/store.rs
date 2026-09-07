@@ -4,6 +4,13 @@
 //! start — the log *is* the storage (nothing is edited in place;
 //! lifecycle transitions are appended operations, mirroring the
 //! resolver's I4 doctrine and the Ruby model's immutable versions).
+//!
+//! The store also holds the discovery descriptors (C3 services, C4
+//! protocol bindings, C5 verification mechanisms) — they are versioned
+//! supersede-able records, the same lifecycle discipline as 19135
+//! items. Signatures are verified at intake; replay re-applies the
+//! already-verified records (signature verification is a creation-time
+//! concern, not a re-validation one).
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -12,6 +19,7 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 
+use crate::discovery::{ProtocolBinding, ServiceDescriptor, VerificationMechanism};
 use crate::model::{ApplicabilityBinding, Item, ItemClass, ItemVersion, Status};
 use crate::time::Timestamp;
 
@@ -33,6 +41,22 @@ pub enum Op {
     },
     /// A dated applicability binding of a profile item to a subject.
     BindApplicability { binding: ApplicabilityBinding },
+    /// Initial registration of a C3 service descriptor (carrying its
+    /// first signed version).
+    RegisterService { descriptor: ServiceDescriptor },
+    /// A new signed version of a service descriptor that supersedes
+    /// `superseded_version`: the old version transitions to
+    /// `superseded` with a successor link.
+    SupersedeService {
+        identifier: String,
+        superseded_version: String,
+        prior_status: crate::discovery::ServiceStatus,
+        successor: crate::discovery::ServiceVersion,
+    },
+    /// A C4 protocol binding.
+    RegisterProtocolBinding { binding: ProtocolBinding },
+    /// A C5 verification mechanism.
+    RegisterVerificationMechanism { mechanism: VerificationMechanism },
 }
 
 /// One record in the append-only audit log.
@@ -71,6 +95,30 @@ impl AuditRecord {
             Op::BindApplicability { binding } => {
                 json!({"op": "bind-applicability", "binding": binding.to_json()})
             }
+            Op::RegisterService { descriptor } => json!({
+                "op": "register-service",
+                "descriptor": descriptor.to_json_value(),
+            }),
+            Op::SupersedeService {
+                identifier,
+                superseded_version,
+                prior_status,
+                successor,
+            } => json!({
+                "op": "supersede-service",
+                "identifier": identifier,
+                "superseded_version": superseded_version,
+                "prior_status": prior_status.as_str(),
+                "successor": successor.to_json(None),
+            }),
+            Op::RegisterProtocolBinding { binding } => json!({
+                "op": "register-protocol-binding",
+                "binding": binding.to_json(),
+            }),
+            Op::RegisterVerificationMechanism { mechanism } => json!({
+                "op": "register-verification-mechanism",
+                "mechanism": mechanism.to_json(),
+            }),
         }
         .as_object()
         .cloned()
@@ -82,7 +130,10 @@ impl AuditRecord {
 
     pub fn from_json(v: &Value) -> Result<AuditRecord, String> {
         let obj = v.as_object().ok_or("audit record must be an object")?;
-        let seq = obj.get("seq").and_then(Value::as_u64).ok_or("missing `seq`")?;
+        let seq = obj
+            .get("seq")
+            .and_then(Value::as_u64)
+            .ok_or("missing `seq`")?;
         let recorded_at = obj
             .get("recorded_at")
             .and_then(Value::as_str)
@@ -119,9 +170,49 @@ impl AuditRecord {
                     obj.get("binding").ok_or("missing `binding`")?,
                 )?,
             },
+            Some("register-service") => Op::RegisterService {
+                descriptor: ServiceDescriptor::from_json_value(
+                    obj.get("descriptor").ok_or("missing `descriptor`")?,
+                )?,
+            },
+            Some("supersede-service") => Op::SupersedeService {
+                identifier: obj
+                    .get("identifier")
+                    .and_then(Value::as_str)
+                    .ok_or("missing `identifier`")?
+                    .to_string(),
+                superseded_version: obj
+                    .get("superseded_version")
+                    .and_then(Value::as_str)
+                    .ok_or("missing `superseded_version`")?
+                    .to_string(),
+                prior_status: crate::discovery::ServiceStatus::parse(
+                    obj.get("prior_status")
+                        .and_then(Value::as_str)
+                        .ok_or("missing `prior_status`")?,
+                )
+                .ok_or("invalid `prior_status`")?,
+                successor: crate::discovery::ServiceVersion::from_json_value(
+                    obj.get("successor").ok_or("missing `successor`")?,
+                )?,
+            },
+            Some("register-protocol-binding") => Op::RegisterProtocolBinding {
+                binding: ProtocolBinding::from_json_value(
+                    obj.get("binding").ok_or("missing `binding`")?,
+                )?,
+            },
+            Some("register-verification-mechanism") => Op::RegisterVerificationMechanism {
+                mechanism: VerificationMechanism::from_json_value(
+                    obj.get("mechanism").ok_or("missing `mechanism`")?,
+                )?,
+            },
             _ => return Err("unknown `op`".to_string()),
         };
-        Ok(AuditRecord { seq, recorded_at, op })
+        Ok(AuditRecord {
+            seq,
+            recorded_at,
+            op,
+        })
     }
 }
 
@@ -136,10 +227,15 @@ pub enum StoreError {
 /// The registry store: items keyed by identifier (identifiers are
 /// unique per service instance; the register is an item attribute —
 /// registers federate as siblings, none is the universal envelope),
-/// applicability bindings, the audit log, and the JSONL journal.
+/// applicability bindings, the audit log, the JSONL journal, and the
+/// discovery descriptors (C3 services, C4 protocol bindings, C5
+/// verification mechanisms).
 pub struct Store {
     items: HashMap<String, Item>,
     bindings: Vec<ApplicabilityBinding>,
+    services: HashMap<String, ServiceDescriptor>,
+    protocol_bindings: HashMap<String, ProtocolBinding>,
+    verification_mechanisms: HashMap<String, VerificationMechanism>,
     log: Vec<AuditRecord>,
     next_binding_id: u64,
     journal: Option<File>,
@@ -152,6 +248,9 @@ impl Store {
         let mut store = Store {
             items: HashMap::new(),
             bindings: Vec::new(),
+            services: HashMap::new(),
+            protocol_bindings: HashMap::new(),
+            verification_mechanisms: HashMap::new(),
             log: Vec::new(),
             next_binding_id: 1,
             journal: None,
@@ -165,12 +264,7 @@ impl Store {
             if path.exists() {
                 store.replay(path)?;
             }
-            store.journal = Some(
-                OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)?,
-            );
+            store.journal = Some(OpenOptions::new().create(true).append(true).open(path)?);
         }
         Ok(store)
     }
@@ -246,6 +340,32 @@ impl Store {
                 self.next_binding_id = self.next_binding_id.max(binding.id + 1);
                 self.bindings.push(binding.clone());
             }
+            Op::RegisterService { descriptor } => {
+                self.services
+                    .insert(descriptor.identifier.clone(), descriptor.clone());
+            }
+            Op::SupersedeService {
+                identifier,
+                superseded_version,
+                successor,
+                ..
+            } => {
+                if let Some(svc) = self.services.get_mut(identifier) {
+                    if let Some(old) = svc.version_mut(superseded_version) {
+                        old.status = crate::discovery::ServiceStatus::Superseded;
+                        old.superseded_by_version = Some(successor.version.clone());
+                    }
+                    svc.versions.push(successor.clone());
+                }
+            }
+            Op::RegisterProtocolBinding { binding } => {
+                self.protocol_bindings
+                    .insert(binding.identifier.clone(), binding.clone());
+            }
+            Op::RegisterVerificationMechanism { mechanism } => {
+                self.verification_mechanisms
+                    .insert(mechanism.identifier.clone(), mechanism.clone());
+            }
         }
     }
 
@@ -256,11 +376,7 @@ impl Store {
     }
 
     /// Items filtered by item class and/or register.
-    pub fn items_filtered(
-        &self,
-        class: Option<ItemClass>,
-        register: Option<&str>,
-    ) -> Vec<&Item> {
+    pub fn items_filtered(&self, class: Option<ItemClass>, register: Option<&str>) -> Vec<&Item> {
         let mut items: Vec<&Item> = self
             .items
             .values()
@@ -272,7 +388,75 @@ impl Store {
     }
 
     pub fn bindings_for(&self, subject: &str) -> Vec<&ApplicabilityBinding> {
-        self.bindings.iter().filter(|b| b.subject == subject).collect()
+        self.bindings
+            .iter()
+            .filter(|b| b.subject == subject)
+            .collect()
+    }
+
+    // -- discovery reads (C3 / C4 / C5) ----------------------------------
+
+    pub fn service(&self, identifier: &str) -> Option<&ServiceDescriptor> {
+        self.services.get(identifier)
+    }
+
+    /// Services filtered by class and/or jurisdiction (as-of at the
+    /// current instant — the descriptor's current version is used for
+    /// the filter values).
+    pub fn services_filtered(
+        &self,
+        class: Option<crate::discovery::ServiceClass>,
+        jurisdiction: Option<&str>,
+    ) -> Vec<&ServiceDescriptor> {
+        let mut out: Vec<&ServiceDescriptor> = self
+            .services
+            .values()
+            .filter(|s| {
+                let v = match s.current_version() {
+                    Some(v) => v,
+                    None => return false,
+                };
+                if let Some(c) = class {
+                    let body_class = v
+                        .body
+                        .get("class")
+                        .and_then(Value::as_str)
+                        .and_then(crate::discovery::ServiceClass::parse);
+                    if body_class != Some(c) {
+                        return false;
+                    }
+                }
+                if let Some(j) = jurisdiction {
+                    let body_jur = v.body.get("jurisdiction").and_then(Value::as_str);
+                    if body_jur != Some(j) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect();
+        out.sort_by(|a, b| a.identifier.cmp(&b.identifier));
+        out
+    }
+
+    pub fn protocol_binding(&self, identifier: &str) -> Option<&ProtocolBinding> {
+        self.protocol_bindings.get(identifier)
+    }
+
+    pub fn protocol_bindings_all(&self) -> Vec<&ProtocolBinding> {
+        let mut out: Vec<&ProtocolBinding> = self.protocol_bindings.values().collect();
+        out.sort_by(|a, b| a.identifier.cmp(&b.identifier));
+        out
+    }
+
+    pub fn verification_mechanism(&self, identifier: &str) -> Option<&VerificationMechanism> {
+        self.verification_mechanisms.get(identifier)
+    }
+
+    pub fn verification_mechanisms_all(&self) -> Vec<&VerificationMechanism> {
+        let mut out: Vec<&VerificationMechanism> = self.verification_mechanisms.values().collect();
+        out.sort_by(|a, b| a.identifier.cmp(&b.identifier));
+        out
     }
 
     // -- mutations (validated, audited) ----------------------------------
@@ -369,6 +553,100 @@ impl Store {
         Ok(self.record(Op::BindApplicability { binding }))
     }
 
+    // -- discovery mutations (C3 / C4 / C5) ------------------------------
+
+    /// Registers a new C3 service descriptor (with its first signed
+    /// version). The caller has already verified the descriptor's
+    /// signature against the operator keyring.
+    pub fn register_service(
+        &mut self,
+        descriptor: ServiceDescriptor,
+    ) -> Result<AuditRecord, StoreError> {
+        if self.services.contains_key(&descriptor.identifier) {
+            return Err(StoreError::Conflict(format!(
+                "service `{}` is already registered; add versions through POST /services/{}/versions",
+                descriptor.identifier, descriptor.identifier
+            )));
+        }
+        Ok(self.record(Op::RegisterService { descriptor }))
+    }
+
+    /// Adds a new signed version of a service descriptor (supersedes
+    /// `target_version`, which must be the current active version).
+    pub fn supersede_service(
+        &mut self,
+        identifier: &str,
+        target_version: &str,
+        successor: crate::discovery::ServiceVersion,
+    ) -> Result<AuditRecord, StoreError> {
+        let Some(svc) = self.services.get(identifier) else {
+            return Err(StoreError::Invalid(format!(
+                "no service descriptor `{identifier}`"
+            )));
+        };
+        if svc.version(&successor.version).is_some() {
+            return Err(StoreError::Conflict(format!(
+                "service `{identifier}` already has a version `{}`",
+                successor.version
+            )));
+        }
+        let Some(target) = svc.version(target_version) else {
+            return Err(StoreError::Invalid(format!(
+                "service `{identifier}` has no version `{target_version}`"
+            )));
+        };
+        if target.status != crate::discovery::ServiceStatus::Active {
+            return Err(StoreError::Invalid(format!(
+                "service version `{target_version}` of `{identifier}` is {} — only the active version can be superseded",
+                target.status.as_str()
+            )));
+        }
+        if successor.effective_from < target.effective_from {
+            return Err(StoreError::Invalid(
+                "new version's `effective_from` precedes the superseded version's window start"
+                    .to_string(),
+            ));
+        }
+        let prior_status = target.status;
+        Ok(self.record(Op::SupersedeService {
+            identifier: identifier.to_string(),
+            superseded_version: target_version.to_string(),
+            prior_status,
+            successor,
+        }))
+    }
+
+    /// Registers a C4 protocol binding.
+    pub fn register_protocol_binding(
+        &mut self,
+        binding: ProtocolBinding,
+    ) -> Result<AuditRecord, StoreError> {
+        if self.protocol_bindings.contains_key(&binding.identifier) {
+            return Err(StoreError::Conflict(format!(
+                "protocol binding `{}` is already registered",
+                binding.identifier
+            )));
+        }
+        Ok(self.record(Op::RegisterProtocolBinding { binding }))
+    }
+
+    /// Registers a C5 verification mechanism.
+    pub fn register_verification_mechanism(
+        &mut self,
+        mechanism: VerificationMechanism,
+    ) -> Result<AuditRecord, StoreError> {
+        if self
+            .verification_mechanisms
+            .contains_key(&mechanism.identifier)
+        {
+            return Err(StoreError::Conflict(format!(
+                "verification mechanism `{}` is already registered",
+                mechanism.identifier
+            )));
+        }
+        Ok(self.record(Op::RegisterVerificationMechanism { mechanism }))
+    }
+
     // -- audit views ------------------------------------------------------
 
     /// The append-only audit log (admin view, paged).
@@ -438,14 +716,22 @@ mod tests {
     fn register_and_lookup() {
         let mut store = Store::open(None).unwrap();
         store
-            .register_item(profile_item("eu-espr-textiles", "1.0.0", "2026-10-18T00:00:00Z"))
+            .register_item(profile_item(
+                "eu-espr-textiles",
+                "1.0.0",
+                "2026-10-18T00:00:00Z",
+            ))
             .unwrap();
         assert!(store.item("eu-espr-textiles").is_some());
         assert!(store.item("nope").is_none());
         assert_eq!(store.log_len(), 1);
         // duplicate registration conflicts
         let err = store
-            .register_item(profile_item("eu-espr-textiles", "2.0.0", "2027-01-01T00:00:00Z"))
+            .register_item(profile_item(
+                "eu-espr-textiles",
+                "2.0.0",
+                "2027-01-01T00:00:00Z",
+            ))
             .unwrap_err();
         assert!(matches!(err, StoreError::Conflict(_)));
     }
@@ -469,10 +755,7 @@ mod tests {
         assert_eq!(old.status, Status::Superseded);
         assert_eq!(old.superseded_by_version.as_deref(), Some("1.0.0"));
         // derived window end
-        assert_eq!(
-            item.window_until(old),
-            Some(ts("2026-07-01T00:00:00Z"))
-        );
+        assert_eq!(item.window_until(old), Some(ts("2026-07-01T00:00:00Z")));
         assert_eq!(item.current_version().unwrap().version, "1.0.0");
         assert_eq!(store.log_len(), 2);
     }
@@ -484,26 +767,51 @@ mod tests {
             .register_item(profile_item("p", "0.9.0", "2026-01-01T00:00:00Z"))
             .unwrap();
         store
-            .supersede("p", "0.9.0", successor("1.0.0", "2026-07-01T00:00:00Z", "r"), None)
+            .supersede(
+                "p",
+                "0.9.0",
+                successor("1.0.0", "2026-07-01T00:00:00Z", "r"),
+                None,
+            )
             .unwrap();
         // unknown target
         assert!(matches!(
-            store.supersede("p", "9.9.9", successor("2.0.0", "2027-01-01T00:00:00Z", "r"), None),
+            store.supersede(
+                "p",
+                "9.9.9",
+                successor("2.0.0", "2027-01-01T00:00:00Z", "r"),
+                None
+            ),
             Err(StoreError::Invalid(_))
         ));
         // already-superseded target
         assert!(matches!(
-            store.supersede("p", "0.9.0", successor("2.0.0", "2027-01-01T00:00:00Z", "r"), None),
+            store.supersede(
+                "p",
+                "0.9.0",
+                successor("2.0.0", "2027-01-01T00:00:00Z", "r"),
+                None
+            ),
             Err(StoreError::Invalid(_))
         ));
         // duplicate version number
         assert!(matches!(
-            store.supersede("p", "1.0.0", successor("1.0.0", "2027-01-01T00:00:00Z", "r"), None),
+            store.supersede(
+                "p",
+                "1.0.0",
+                successor("1.0.0", "2027-01-01T00:00:00Z", "r"),
+                None
+            ),
             Err(StoreError::Conflict(_))
         ));
         // window start before the superseded version's window start
         assert!(matches!(
-            store.supersede("p", "1.0.0", successor("2.0.0", "2026-06-01T00:00:00Z", "r"), None),
+            store.supersede(
+                "p",
+                "1.0.0",
+                successor("2.0.0", "2026-06-01T00:00:00Z", "r"),
+                None
+            ),
             Err(StoreError::Invalid(_))
         ));
     }
