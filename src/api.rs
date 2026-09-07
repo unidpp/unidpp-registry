@@ -11,7 +11,11 @@
 //!
 //! Subregisters are item classes mounted at their plural names
 //! (`/data-elements`, `/profiles`, `/crypto-suites`, `/transforms`,
-//! `/trust-anchors`, `/units`) with the same endpoints, class-scoped.
+//! `/trust-anchors`, `/units`, `/cross-register-mappings`) with the
+//! same endpoints, class-scoped. Two classes have dedicated
+//! surfaces: `/models` (EXPRESS deposits with content hash and
+//! expressir validation) and `/schemas/profile-manifest` (the
+//! generated manifest JSON Schema).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -26,12 +30,17 @@ use axum::{Extension, Router};
 use serde_json::{json, Map, Value};
 use tokio::net::TcpListener;
 
+use crate::clock;
 use crate::discovery::{
     key_id as operator_key_id, operator_id as operator_id_of, operator_public_key, operator_record,
     parse_protocol_body, parse_service_body, parse_verification_body, sign_body, OperatorKeyring,
     ProtocolBinding, ServiceClass, ServiceDescriptor, ServiceStatus, ServiceVersion,
     SignatureValue, VerificationMechanism,
 };
+use crate::express::{self, ValidationRecord};
+use crate::intake::{self, IntakeContext, IntakeError, IntakeWarning};
+use crate::manifest;
+use crate::mapping;
 use crate::model::{ApplicabilityBinding, Item, ItemClass, ItemVersion, Status};
 use crate::store::{Store, StoreError};
 use crate::time::Timestamp;
@@ -52,6 +61,11 @@ pub struct Config {
     /// verification mechanisms + SI base + kWh / MJ / J units with ISO
     /// 80000 citations). Defaults to `true`.
     pub seed_on_demand: bool,
+    /// When true, the serving binary deposits the vendored UniDPP
+    /// EXPRESS core schema as the first `model` item (item 58's
+    /// first deposit). Defaults to `true`; disabled with
+    /// `UNIDPP_REGISTRY_SEED_EXPRESS=0`.
+    pub seed_express: bool,
 }
 
 impl Default for Config {
@@ -61,6 +75,7 @@ impl Default for Config {
             admin_token: None,
             state_file: None,
             seed_on_demand: true,
+            seed_express: true,
         }
     }
 }
@@ -86,6 +101,12 @@ impl Config {
         }
         if let Ok(s) = std::env::var("UNIDPP_REGISTRY_SEED_ON_DEMAND") {
             c.seed_on_demand = !matches!(
+                s.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            );
+        }
+        if let Ok(s) = std::env::var("UNIDPP_REGISTRY_SEED_EXPRESS") {
+            c.seed_express = !matches!(
                 s.trim().to_ascii_lowercase().as_str(),
                 "0" | "false" | "no" | "off"
             );
@@ -169,6 +190,44 @@ fn store_error(e: StoreError) -> Response {
         StoreError::Conflict(m) => conflict(&m),
         StoreError::Invalid(m) => bad_request(&m),
     }
+}
+
+/// Structured intake rejection: the failing check and the precise
+/// field paths, machine-readable.
+fn intake_error_response(errors: &[IntakeError]) -> Response {
+    let list: Vec<serde_json::Value> = errors
+        .iter()
+        .map(|e| json!({"check": e.check, "path": e.path, "message": e.message}))
+        .collect();
+    let msg = match errors.first() {
+        Some(e) => format!("{} rejected the item: {}", e.check, e.message),
+        None => "intake validation failed".to_string(),
+    };
+    stamped(
+        StatusCode::BAD_REQUEST,
+        &json!({"error": msg, "errors": list}),
+        Timestamp::now(),
+    )
+}
+
+/// Runs the intake validator chain against the store (read-only
+/// borrows; integrity checks look, they never mutate).
+fn run_intake_checks(
+    store: &Store,
+    item: &Item,
+    strict: bool,
+) -> Result<Vec<IntakeWarning>, Response> {
+    let ctx = IntakeContext { store, strict };
+    intake::run(&intake::default_chain(), item, &ctx).map_err(|e| intake_error_response(&e))
+}
+
+fn warnings_json(warnings: &[IntakeWarning]) -> Option<serde_json::Value> {
+    (!warnings.is_empty()).then(|| {
+        json!(warnings
+            .iter()
+            .map(|w| json!({"check": w.check, "path": w.path, "message": w.message}))
+            .collect::<Vec<_>>())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -401,6 +460,13 @@ async fn discovery() -> Result<Response, Response> {
             "register_verification_mechanism": "POST /verification-mechanisms",
             "list_verification_mechanisms": "GET /verification-mechanisms",
             "verification_mechanism": "GET /verification-mechanisms/{id}",
+            "profile_manifest_schema": "GET /schemas/profile-manifest",
+            "deposit_model": "POST /models (EXPRESS source + metadata; content hash + expressir validation)",
+            "list_models": "GET /models?register=&at=",
+            "model_as_of": "GET /models/{id}?at=&hash= (hash-pinned retrieval)",
+            "validate_model": "POST /models/{id}/validate",
+            "list_cross_register_mappings": "GET /cross-register-mappings?item=&source=&target=&register=&at=",
+            "applicability_subject_facts": "GET /applicability?product_type=&at=&subject_facts=<json> (or POST with {product_type, at, subject_facts}) — evaluates clock predicates",
             "audit_log": "GET /admin/log?limit=&offset=",
             "seed": "POST /admin/seed",
             "health": "GET /healthz"
@@ -418,6 +484,8 @@ async fn discovery() -> Result<Response, Response> {
             "service_descriptor_signature": "Ed25519 over canonical-JSON of body (signature block excluded); operator id is content-derived from the public key",
             "operator_keyring": "seeded dev keyring: unidpp-{registry,issuer,resolver,trust,log,archive,cli-verifier,edge}; loaded at startup; signatures are verified at intake only (replay re-applies the stored record)"
         },
+        "intake_checks": ["profile-manifest-schema", "profile-satisfiability", "cross-register-mapping-integrity"],
+        "model_validation": "expressir (gem install expressir; `expressir validate load` run as a subprocess); deposits without expressir on PATH are stored with validation.status = pending",
         "auth": "mutations require a Bearer token when UNIDPP_REGISTRY_ADMIN_TOKEN is set"
     });
     Ok(stamped(StatusCode::OK, &doc, Timestamp::now()))
@@ -450,6 +518,12 @@ async fn create_item(
     let identifier = req_str(&v, "item_id")?.trim().to_string();
     validate_token(&identifier, "item_id")?;
     let item_class = body_class(&v, scope)?;
+    if item_class == ItemClass::Model {
+        return Err(bad_request(
+            "model items are deposited through POST /models (EXPRESS source + content hash + expressir validation)",
+        ));
+    }
+    let strict = opt_bool(&v, "strict")?.unwrap_or(true);
     let title = body_title(&v)?;
     let submitting_organization = opt_str(&v, "submitting_organization")?;
     let version_number = req_str(&v, "version")?.trim().to_string();
@@ -506,13 +580,18 @@ async fn create_item(
             "manifest `version` must be pinned to a registered version of the item",
         ));
     }
-    let audit_seq = {
+    let (audit_seq, warnings) = {
         let mut store = app.store.lock().expect("store poisoned");
-        store.register_item(item.clone()).map_err(store_error)?.seq
+        let warnings = run_intake_checks(&store, &item, strict)?;
+        let seq = store.register_item(item.clone()).map_err(store_error)?.seq;
+        (seq, warnings)
     };
     let mut body = item_view(&item, None, now);
     if let Some(m) = body.as_object_mut() {
         m.insert("audit_seq".into(), json!(audit_seq));
+        if let Some(w) = warnings_json(&warnings) {
+            m.insert("warnings".into(), w);
+        }
     }
     Ok(stamped(StatusCode::CREATED, &body, now))
 }
@@ -605,6 +684,7 @@ async fn supersede_item(
             ));
         }
     }
+    let strict = opt_bool(&v, "strict")?.unwrap_or(true);
     let manifest = opt_object(&v, "manifest")?;
     let successor = ItemVersion {
         version: version_number.clone(),
@@ -620,6 +700,14 @@ async fn supersede_item(
         let item = find_item(&store, &identifier, scope, register.as_deref())
             .ok_or_else(|| not_found(&format!("no registry item `{identifier}`")))?
             .clone();
+        // the effective manifest (new, or carried over) is validated
+        // like an intake — the class checks pick the item up by
+        // class, not by endpoint
+        let mut candidate = item.clone();
+        if manifest.is_some() {
+            candidate.manifest = manifest.clone();
+        }
+        let warnings = run_intake_checks(&store, &candidate, strict)?;
         if let Some(pinned) = manifest
             .as_ref()
             .and_then(|m| m.get("version"))
@@ -648,14 +736,14 @@ async fn supersede_item(
         let after = find_item(&store, &identifier, scope, register.as_deref())
             .cloned()
             .expect("item exists after supersede");
-        (rec.seq, after, target)
+        (rec.seq, after, target, warnings)
     };
-    let (audit_seq, after, target) = outcome;
+    let (audit_seq, after, target, warnings) = outcome;
     let new_version = after
         .version(&version_number)
         .expect("successor registered");
     let old_version = after.version(&target).expect("target retained");
-    let body = json!({
+    let mut body = json!({
         "identifier": identifier,
         "new_version": new_version.to_json(after.window_until(new_version)),
         "superseded_version": old_version.to_json(after.window_until(old_version)),
@@ -664,6 +752,11 @@ async fn supersede_item(
         "audit_seq": audit_seq,
         "as_of": now.to_string(),
     });
+    if let Some(w) = warnings_json(&warnings) {
+        if let Some(m) = body.as_object_mut() {
+            m.insert("warnings".into(), w);
+        }
+    }
     Ok(stamped(StatusCode::CREATED, &body, now))
 }
 
@@ -716,6 +809,26 @@ async fn bind_applicability(
     }
     let v = parse_body(&body)?;
     let now = Timestamp::now();
+    // POST /applicability with `subject_facts` (and no profile to
+    // bind) is an evaluation request, not a mutation.
+    if v.get("subject_facts").is_some() {
+        if v.get("profile_id").is_some() {
+            return Err(bad_request(
+                "cannot bind with `subject_facts`: subject_facts marks an evaluation request (drop `profile_id`)",
+            ));
+        }
+        let subject = match v.get("product_type").or_else(|| v.get("subject")) {
+            Some(Value::String(s)) if !s.trim().is_empty() => s.trim().to_string(),
+            _ => return Err(bad_request("`product_type` is required")),
+        };
+        let facts = match v.get("subject_facts") {
+            Some(f @ Value::Object(_)) => f.clone(),
+            _ => return Err(bad_request("`subject_facts` must be a JSON object")),
+        };
+        let at = opt_ts(&v, "at")?;
+        let doc = evaluate_applicability(&app, &subject, at, Some(&facts))?;
+        return Ok(stamped(StatusCode::OK, &doc, now));
+    }
     let profile_item = req_str(&v, "profile_id")?.trim().to_string();
     validate_token(&profile_item, "profile_id")?;
     let subject = match v.get("product_type").or_else(|| v.get("subject")) {
@@ -758,44 +871,135 @@ async fn bind_applicability(
     Ok(stamped(StatusCode::CREATED, &body, now))
 }
 
-/// GET /applicability?product_type=&at= — which profiles applied at
-/// `at` (legal as-of semantics: retroactive bindings apply from their
-/// `effective_from`; non-retroactive ones only from `registered_at`).
+/// GET /applicability?product_type=&at=&subject_facts= — which
+/// profiles applied at `at` (legal as-of semantics: retroactive
+/// bindings apply from their `effective_from`; non-retroactive ones
+/// only from `registered_at`). With `subject_facts` (a JSON object),
+/// clock predicates on the bound profiles' manifests are evaluated
+/// at the query instant: a time-triggered profile binds only once
+/// its threshold (`basis + duration`) is crossed. Fact predicates
+/// are evaluated locally by the subject's custodian, never here.
 async fn applicability_query(
     State(app): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response, Response> {
     let at = parse_at(&params)?;
-    let as_of = at.unwrap_or_else(Timestamp::now);
     let subject = match opt_query(&params, "product_type").or_else(|| opt_query(&params, "subject"))
     {
         Some(s) => s,
         None => return Err(bad_request("`product_type` is required")),
     };
-    let applicability = {
-        let store = app.store.lock().expect("store poisoned");
-        store
-            .bindings_for(&subject)
-            .iter()
-            .filter(|b| b.applies_at(as_of))
-            .map(|b| {
-                let profile = store
-                    .item(&b.profile_item)
-                    .map(|item| item_summary(item, at))
-                    .unwrap_or(Value::Null);
-                json!({"binding": b.to_json(), "profile": profile})
-            })
-            .collect::<Vec<_>>()
+    let facts = match opt_query(&params, "subject_facts") {
+        None => None,
+        Some(raw) => Some(parse_subject_facts(&raw)?),
     };
+    let doc = evaluate_applicability(&app, &subject, at, facts.as_ref())?;
     Ok(stamped(
         StatusCode::OK,
-        &json!({
-            "as_of": as_of.to_string(),
-            "product_type": subject,
-            "applicability": applicability,
-        }),
-        as_of,
+        &doc,
+        at.unwrap_or_else(Timestamp::now),
     ))
+}
+
+/// Parses the `subject_facts` JSON document (query parameter or
+/// request body): must be a JSON object.
+fn parse_subject_facts(raw: &str) -> Result<Value, Response> {
+    let v: Value = serde_json::from_str(raw)
+        .map_err(|e| bad_request(&format!("`subject_facts` must be a JSON object: {e}")))?;
+    if !v.is_object() {
+        return Err(bad_request("`subject_facts` must be a JSON object"));
+    }
+    Ok(v)
+}
+
+/// The applicability evaluation core, shared by the GET (query
+/// parameter) and POST (request body) forms: reuses the binding
+/// store's as-of machinery (`applies_at`), then — only when subject
+/// facts were supplied — evaluates each bound profile's clock
+/// predicates at the same instant.
+fn evaluate_applicability(
+    app: &Arc<AppState>,
+    subject: &str,
+    at: Option<Timestamp>,
+    facts: Option<&Value>,
+) -> Result<Value, Response> {
+    let as_of = at.unwrap_or_else(Timestamp::now);
+    let mut applicability = Vec::new();
+    let mut unresolved = Vec::new();
+    {
+        let store = app.store.lock().expect("store poisoned");
+        for b in store.bindings_for(subject) {
+            if !b.applies_at(as_of) {
+                continue;
+            }
+            let profile = store.item(&b.profile_item);
+            let triggers = match profile
+                .and_then(|p| p.manifest.as_ref())
+                .map(clock::time_triggers)
+            {
+                None => Vec::new(),
+                Some(Ok(t)) => t,
+                Some(Err(e)) => {
+                    return Err(bad_request(&format!(
+                        "profile `{}` carries a malformed time trigger: {e}",
+                        b.profile_item
+                    )))
+                }
+            };
+            if triggers.is_empty() {
+                applicability.push(json!({
+                    "binding": b.to_json(),
+                    "profile": profile.map(|item| item_summary(item, at)).unwrap_or(Value::Null),
+                }));
+                continue;
+            }
+            // clock-fired applicability: the registry can only decide
+            // with the subject's facts
+            let Some(facts) = facts else {
+                unresolved.push(json!({
+                    "binding": b.to_json(),
+                    "profile_item": b.profile_item,
+                    "reason": "the profile's triggers are clock predicates; supply subject_facts to evaluate them",
+                }));
+                continue;
+            };
+            let mut evaluations = Vec::new();
+            let mut binds = true;
+            for (index, t) in &triggers {
+                match clock::evaluate(t, facts, as_of) {
+                    Ok(e) => {
+                        if !e.satisfied {
+                            binds = false;
+                        }
+                        evaluations.push(json!({
+                            "index": index,
+                            "basis": t.basis,
+                            "operator": t.operator,
+                            "duration": t.duration_raw,
+                            "threshold": e.threshold.to_string(),
+                            "satisfied": e.satisfied,
+                        }));
+                    }
+                    // a subject that does not carry the basis fact is
+                    // not in the predicate's scope
+                    Err(_) => binds = false,
+                }
+            }
+            if binds {
+                applicability.push(json!({
+                    "binding": b.to_json(),
+                    "profile": profile.map(|item| item_summary(item, at)).unwrap_or(Value::Null),
+                    "time_triggers": evaluations,
+                }));
+            }
+        }
+    }
+    Ok(json!({
+        "as_of": as_of.to_string(),
+        "product_type": subject,
+        "applicability": applicability,
+        "unresolved": unresolved,
+    }))
 }
 
 /// GET /admin/log — the append-only audit log (admin, paged).
@@ -1356,6 +1560,294 @@ async fn get_verification_mechanism(
 }
 
 // ---------------------------------------------------------------------------
+// Profile manifest schema (item 51) — the generated JSON Schema,
+// served with as-of semantics
+// ---------------------------------------------------------------------------
+
+/// GET /schemas/profile-manifest — the JSON Schema (draft 2020-12)
+/// generated from the canonical manifest model. The `as_of` member
+/// is serving metadata (not a validation keyword; draft 2020-12
+/// validators ignore it); the schema version rides in `$id`.
+async fn get_profile_manifest_schema(
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Response, Response> {
+    let at = parse_at(&params)?;
+    let as_of = at.unwrap_or_else(Timestamp::now);
+    let doc = manifest::stamped_schema(manifest::profile_manifest_schema(), as_of);
+    Ok(build_response(
+        StatusCode::OK,
+        vec![
+            ("content-type".into(), "application/schema+json".into()),
+            ("x-as-of".into(), as_of.to_string()),
+        ],
+        serde_json::to_string_pretty(&doc).unwrap(),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// EXPRESS model deposits (item 58 / T-08)
+// ---------------------------------------------------------------------------
+
+/// POST /models — deposit an EXPRESS model: source text + metadata;
+/// content hash over the exact bytes; expressir validation
+/// (subprocess; `pending` when the binary is absent; `invalid`
+/// deposits are rejected).
+async fn deposit_model(
+    State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<Response, Response> {
+    if let Some(deny) = require_admin(&app, &headers) {
+        return Ok(deny);
+    }
+    let v = parse_body(&body)?;
+    let register = req_str(&v, "register_id")?.trim().to_string();
+    let identifier = req_str(&v, "item_id")?.trim().to_string();
+    validate_token(&identifier, "item_id")?;
+    let title = body_title(&v)?;
+    let submitting_organization = opt_str(&v, "submitting_organization")?;
+    let version_number = req_str(&v, "version")?.trim().to_string();
+    validate_token(&version_number, "version")?;
+    let source = req_str(&v, "source")?.to_string();
+    let now = Timestamp::now();
+    let effective_from = opt_ts(&v, "effective_from")?.unwrap_or(now);
+    let effective_until = opt_ts(&v, "effective_until")?;
+    if let Some(until) = effective_until {
+        if until <= effective_from {
+            return Err(bad_request(
+                "`effective_until` must be after `effective_from`",
+            ));
+        }
+    }
+    let validation = express::validate_with_expressir(&source);
+    if validation.status == express::ValidationStatus::Invalid {
+        return Err(bad_request(&format!(
+            "expressir rejected the EXPRESS source: {}",
+            validation
+                .detail
+                .as_deref()
+                .unwrap_or("no detail available")
+        )));
+    }
+    let item = Item {
+        identifier: identifier.clone(),
+        register,
+        item_class: ItemClass::Model,
+        title,
+        submitting_organization,
+        versions: vec![ItemVersion {
+            version: version_number.clone(),
+            status: Status::Valid,
+            effective_from: Some(effective_from),
+            effective_until,
+            registered_at: Some(now),
+            superseded_by_version: None,
+            notes: None,
+        }],
+        manifest: Some(express::model_manifest(
+            &version_number,
+            &source,
+            &validation,
+        )),
+    };
+    let audit_seq = {
+        let mut store = app.store.lock().expect("store poisoned");
+        store.register_item(item).map_err(store_error)?.seq
+    };
+    let body = json!({
+        "identifier": identifier,
+        "item_class": "model",
+        "version": version_number,
+        "content_hash": express::content_hash(&source),
+        "validation": validation.to_json(),
+        "audit_seq": audit_seq,
+        "as_of": now.to_string(),
+    });
+    Ok(stamped(StatusCode::CREATED, &body, now))
+}
+
+/// GET /models — list deposited models with their validation status.
+async fn list_models(
+    State(app): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Response, Response> {
+    let at = parse_at(&params)?;
+    let as_of = at.unwrap_or_else(Timestamp::now);
+    let register = opt_query(&params, "register");
+    let items: Vec<Value> = {
+        let store = app.store.lock().expect("store poisoned");
+        store
+            .items_filtered(Some(ItemClass::Model), register.as_deref())
+            .iter()
+            .map(|item| {
+                let mut summary = item_summary(item, at);
+                if let Some(m) = summary.as_object_mut() {
+                    m.insert(
+                        "validation".into(),
+                        json!(intake::model_validation_status(item).as_str()),
+                    );
+                }
+                summary
+            })
+            .collect()
+    };
+    Ok(stamped(
+        StatusCode::OK,
+        &json!({"as_of": as_of.to_string(), "count": items.len(), "models": items}),
+        as_of,
+    ))
+}
+
+/// GET /models/{id}?at=&hash= — the deposited source, its content
+/// hash and validation status. With `hash=`, retrieval is pinned to
+/// that hash (mismatch → 409).
+async fn get_model(
+    State(app): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+    Path(identifier): Path<String>,
+) -> Result<Response, Response> {
+    let at = parse_at(&params)?;
+    let as_of = at.unwrap_or_else(Timestamp::now);
+    let found = {
+        let store = app.store.lock().expect("store poisoned");
+        find_item(&store, &identifier, Some(ItemClass::Model), None).cloned()
+    };
+    let Some(item) = found else {
+        return Err(not_found(&format!("no model item `{identifier}`")));
+    };
+    let Some(manifest) = &item.manifest else {
+        return Err(bad_request("model item carries no deposit manifest"));
+    };
+    let deposit = express::deposit_from_manifest(manifest)
+        .map_err(|e| bad_request(&format!("corrupt model manifest: {e}")))?;
+    if let Some(pinned) = opt_query(&params, "hash") {
+        if pinned != deposit.content_hash {
+            return Err(conflict(&format!(
+                "content hash mismatch: the deposit is `{}` but `{pinned}` was pinned",
+                deposit.content_hash
+            )));
+        }
+    }
+    let mut body = item_view(&item, at, as_of);
+    if let Some(m) = body.as_object_mut() {
+        m.insert("source".into(), json!(deposit.source));
+        m.insert("content_hash".into(), json!(deposit.content_hash));
+        m.insert("validation".into(), deposit.validation.to_json());
+    }
+    Ok(stamped(StatusCode::OK, &body, as_of))
+}
+
+/// POST /models/{id}/validate — re-run expressir validation over the
+/// stored source and record the outcome (the degrade path: deposits
+/// stored `pending` become `valid`/`invalid` once expressir is
+/// available).
+async fn validate_model(
+    State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(identifier): Path<String>,
+) -> Result<Response, Response> {
+    if let Some(deny) = require_admin(&app, &headers) {
+        return Ok(deny);
+    }
+    let now = Timestamp::now();
+    // Read the stored source under one short lock, run the validator
+    // with no lock held, then record the outcome under a second
+    // short lock (never hold the store across the subprocess).
+    let (source, current) = {
+        let store = app.store.lock().expect("store poisoned");
+        let Some(item) = find_item(&store, &identifier, Some(ItemClass::Model), None) else {
+            return Err(not_found(&format!("no model item `{identifier}`")));
+        };
+        let Some(manifest) = &item.manifest else {
+            return Err(bad_request("model item carries no deposit manifest"));
+        };
+        let deposit = express::deposit_from_manifest(manifest)
+            .map_err(|e| bad_request(&format!("corrupt model manifest: {e}")))?;
+        let current = item
+            .current_version()
+            .map(|v| v.version.clone())
+            .ok_or_else(|| bad_request(&format!("model `{identifier}` has no current version")))?;
+        (deposit.source, current)
+    };
+    let validation: ValidationRecord = express::validate_with_expressir(&source);
+    {
+        let mut store = app.store.lock().expect("store poisoned");
+        store
+            .update_model_validation(&identifier, &current, &validation)
+            .map_err(store_error)?;
+    }
+    let body = json!({
+        "identifier": identifier,
+        "validation": validation.to_json(),
+        "as_of": now.to_string(),
+    });
+    Ok(stamped(StatusCode::OK, &body, now))
+}
+
+// ---------------------------------------------------------------------------
+// Cross-register mappings (item 57 / T-07) — lookup from either
+// direction
+// ---------------------------------------------------------------------------
+
+/// GET /cross-register-mappings?item=&source=&target= — mappings by
+/// referenced item: `item` matches either end; `source`/`target`
+/// match the named end.
+async fn list_cross_register_mappings(
+    State(app): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Response, Response> {
+    let at = parse_at(&params)?;
+    let as_of = at.unwrap_or_else(Timestamp::now);
+    let register = opt_query(&params, "register");
+    let lookup_item = opt_query(&params, "item");
+    let source = opt_query(&params, "source");
+    let target = opt_query(&params, "target");
+    if lookup_item.is_none() && source.is_none() && target.is_none() {
+        return Err(bad_request(
+            "one of `item` (either direction), `source` or `target` is required",
+        ));
+    }
+    let items: Vec<Value> = {
+        let store = app.store.lock().expect("store poisoned");
+        store
+            .items_filtered(Some(ItemClass::CrossRegisterMapping), register.as_deref())
+            .iter()
+            .filter(|item| {
+                mapping::matches_query(
+                    item,
+                    lookup_item.as_deref(),
+                    source.as_deref(),
+                    target.as_deref(),
+                )
+            })
+            .map(|item| {
+                let mut summary = item_summary(item, at);
+                if let Some(m) = summary.as_object_mut() {
+                    if let Some(manifest) = &item.manifest {
+                        m.insert("manifest".into(), manifest.clone());
+                    }
+                }
+                summary
+            })
+            .collect()
+    };
+    Ok(stamped(
+        StatusCode::OK,
+        &json!({
+            "as_of": as_of.to_string(),
+            "count": items.len(),
+            "mappings": items,
+            "query": {
+                "item": lookup_item,
+                "source": source,
+                "target": target,
+            },
+        }),
+        as_of,
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Seed endpoint (admin) — populates the seed dataset: our own services,
 // protocol bindings, verification mechanisms, and units (ISO 80000-
 // cited SI base + kWh / MJ / J).
@@ -1764,6 +2256,68 @@ async fn one_item_chain(
     item_chain(state, query, path, None).await
 }
 
+// Cross-register-mapping subregister wrappers (class from the mount
+// point; the intake chain does the class's own validation).
+
+async fn mappings_create(
+    state: State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<Response, Response> {
+    create_item(state, headers, body, Some(ItemClass::CrossRegisterMapping)).await
+}
+
+/// GET /cross-register-mappings — with `item`/`source`/`target`
+/// filters, the directional lookup; without them, the generic
+/// class-scoped listing.
+async fn mappings_get_or_list(
+    state: State<Arc<AppState>>,
+    query: Query<HashMap<String, String>>,
+) -> Result<Response, Response> {
+    let directional = ["item", "source", "target"]
+        .iter()
+        .any(|k| query.get(*k).map(|v| !v.trim().is_empty()).unwrap_or(false));
+    if directional {
+        list_cross_register_mappings(state, query).await
+    } else {
+        list_items(state, query, Some(ItemClass::CrossRegisterMapping)).await
+    }
+}
+
+async fn mappings_get_one(
+    state: State<Arc<AppState>>,
+    query: Query<HashMap<String, String>>,
+    path: Path<String>,
+) -> Result<Response, Response> {
+    get_item(state, query, path, Some(ItemClass::CrossRegisterMapping)).await
+}
+
+async fn mappings_supersede_one(
+    state: State<Arc<AppState>>,
+    headers: HeaderMap,
+    query: Query<HashMap<String, String>>,
+    path: Path<String>,
+    body: String,
+) -> Result<Response, Response> {
+    supersede_item(
+        state,
+        headers,
+        query,
+        path,
+        body,
+        Some(ItemClass::CrossRegisterMapping),
+    )
+    .await
+}
+
+async fn mappings_chain(
+    state: State<Arc<AppState>>,
+    query: Query<HashMap<String, String>>,
+    path: Path<String>,
+) -> Result<Response, Response> {
+    item_chain(state, query, path, Some(ItemClass::CrossRegisterMapping)).await
+}
+
 // Subregister wrappers (class from the mount point).
 
 async fn sub_create(
@@ -1855,8 +2409,34 @@ pub fn router(app: Arc<AppState>) -> Router {
         )
         .route("/admin/log", get(admin_log))
         .route("/admin/seed", post(admin_seed))
+        .route(
+            "/schemas/profile-manifest",
+            get(get_profile_manifest_schema),
+        )
+        .route("/models", get(list_models).post(deposit_model))
+        .route("/models/{id}", get(get_model))
+        .route("/models/{id}/validate", post(validate_model))
+        .route(
+            "/cross-register-mappings",
+            get(mappings_get_or_list).post(mappings_create),
+        )
+        .route("/cross-register-mappings/{id}", get(mappings_get_one))
+        .route(
+            "/cross-register-mappings/{id}/versions",
+            post(mappings_supersede_one),
+        )
+        .route(
+            "/cross-register-mappings/{id}/supersession",
+            get(mappings_chain),
+        )
         .with_state(app.clone());
+    // Model and cross-register-mapping have dedicated surfaces
+    // (deposit semantics / directional lookup); every other class
+    // mounts the generic subregister.
     for class in ItemClass::ALL {
+        if matches!(class, ItemClass::Model | ItemClass::CrossRegisterMapping) {
+            continue;
+        }
         r = r.nest(
             &format!("/{}", class.plural()),
             subregister(app.clone(), class),
@@ -1868,6 +2448,7 @@ pub fn router(app: Arc<AppState>) -> Router {
 /// Run until stopped (used by `main`).
 pub async fn run(config: Config) -> std::io::Result<()> {
     let app = Arc::new(AppState::new(config.clone())?);
+    seed_express_deposit(&app);
     let listener = TcpListener::bind(config.bind).await?;
     eprintln!("unidpp-registry listening on http://{}", config.bind);
     axum::serve(listener, router(app)).await
@@ -1912,5 +2493,104 @@ impl TestServer {
         if let Some(join) = self.join.take() {
             let _ = join.await;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The first model deposit (item 58): the vendored UniDPP EXPRESS
+// core schema, deposited by the serving binary (not the test
+// TestServer, and not /admin/seed — the seed dataset's counts are a
+// stable contract). Idempotent: a journaled deposit is not repeated.
+// ---------------------------------------------------------------------------
+
+/// The vendored UNIDPP_CORE schema (see assets/unidpp-core.express
+/// for provenance).
+pub const UNIDPP_CORE_EXPRESS: &str = include_str!("../assets/unidpp-core.express");
+
+/// Deposits the UniDPP EXPRESS core schema as the first `model` item
+/// (validation runs through the same expressir path as any deposit;
+/// absent expressir leaves it `pending` for `POST
+/// /models/{id}/validate`). No-op when the config disables it or the
+/// item is already registered.
+pub fn seed_express_deposit(app: &Arc<AppState>) {
+    if !app.config.seed_express {
+        return;
+    }
+    const ID: &str = "unidpp-core-express";
+    const VERSION: &str = "0.1.0";
+    {
+        let store = app.store.lock().expect("store poisoned");
+        if store.item(ID).is_some() {
+            return;
+        }
+    }
+    let validation = express::validate_with_expressir(UNIDPP_CORE_EXPRESS);
+    let now = Timestamp::now();
+    let item = Item {
+        identifier: ID.to_string(),
+        register: "unidpp-seed".to_string(),
+        item_class: ItemClass::Model,
+        title: "UniDPP EXPRESS core model (UNIDPP_CORE)".to_string(),
+        submitting_organization: Some("UniDPP".to_string()),
+        versions: vec![ItemVersion {
+            version: VERSION.to_string(),
+            status: Status::Valid,
+            effective_from: Some(now),
+            effective_until: None,
+            registered_at: Some(now),
+            superseded_by_version: None,
+            notes: Some("the registry's first EXPRESS deposit (T-08)".to_string()),
+        }],
+        manifest: Some(express::model_manifest(
+            VERSION,
+            UNIDPP_CORE_EXPRESS,
+            &validation,
+        )),
+    };
+    let mut store = app.store.lock().expect("store poisoned");
+    if let Err(e) = store.register_item(item) {
+        eprintln!("unidpp-registry: express seed deposit failed: {e:?}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn express_seed_deposits_once_with_hash_and_validation() {
+        let app = Arc::new(AppState::new(Config::default()).unwrap());
+        seed_express_deposit(&app);
+        seed_express_deposit(&app); // idempotent
+        let store = app.store.lock().expect("store poisoned");
+        let item = store.item("unidpp-core-express").expect("seeded");
+        assert_eq!(item.item_class, ItemClass::Model);
+        assert_eq!(store.log_len(), 1, "one audit record, not two");
+        let deposit =
+            express::deposit_from_manifest(item.manifest.as_ref().unwrap()).expect("manifest");
+        assert_eq!(deposit.source, UNIDPP_CORE_EXPRESS);
+        assert_eq!(
+            deposit.content_hash,
+            express::content_hash(UNIDPP_CORE_EXPRESS)
+        );
+        assert_ne!(
+            deposit.validation.status,
+            express::ValidationStatus::Invalid,
+            "the vendored schema validates (or is pending without expressir)"
+        );
+    }
+
+    #[tokio::test]
+    async fn express_seed_respects_the_config_flag() {
+        let app = Arc::new(
+            AppState::new(Config {
+                seed_express: false,
+                ..Config::default()
+            })
+            .unwrap(),
+        );
+        seed_express_deposit(&app);
+        let store = app.store.lock().expect("store poisoned");
+        assert!(store.item("unidpp-core-express").is_none());
     }
 }

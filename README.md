@@ -89,15 +89,22 @@ Public (reads):
 | `GET /items?class=&register=&at=` | list items (class/register scoped), each with its resolved version |
 | `GET /items/{id}?at=&register=` | the item + the version in force at `at` (null before its first window); without `at` the current registered version |
 | `GET /items/{id}/supersession?from=` | the supersession chain (to the terminal version) |
-| `GET /applicability?product_type=&at=` | which profiles applied to the product type at `at` |
+| `GET /applicability?product_type=&at=&subject_facts=` | which profiles applied to the product type at `at`; with `subject_facts` (a URL-encoded JSON object) clock predicates on the bound profiles are evaluated at `at` (entries whose triggers cannot fire yet are excluded; time-triggered bindings without facts are listed under `unresolved`) |
+| `GET /schemas/profile-manifest` | the profile-manifest JSON Schema (draft 2020-12), generated from the canonical Rust model; as-of stamped |
+| `GET /models?register=&at=` | deposited EXPRESS models, with validation status |
+| `GET /models/{id}?at=&hash=` | a deposit's source, content hash and validation status; with `hash=` retrieval is pinned (mismatch → 409) |
+| `GET /cross-register-mappings?item=&source=&target=&register=&at=` | mappings by referenced item — `item` matches either end, `source`/`target` the named end |
 
 Admin (Bearer `UNIDPP_REGISTRY_ADMIN_TOKEN` when set; open in dev mode):
 
 | Endpoint | Body | Meaning |
 |---|---|---|
-| `POST /items` | `{register_id, item_id, class, definition, version, status?, effective_from?, effective_until?, submitting_organization?, manifest?}` | register a new item with its first version (`status` must be `valid` when given) |
-| `POST /items/{id}/versions` | `{version, reason, effective_from?, effective_until?, supersede_version?, manifest?}` | supersede: new version + reason; the old (default: current valid) transitions to `superseded` with derived window end |
+| `POST /items` | `{register_id, item_id, class, definition, version, status?, effective_from?, effective_until?, submitting_organization?, manifest?, strict?}` | register a new item with its first version (`status` must be `valid` when given); class `profile` manifests are validated against the served JSON Schema and checked for satisfiability, class `cross-register-mapping` manifests for referential integrity — rejections carry the field path (`strict=false` downgrades satisfiability failures to warnings) |
+| `POST /items/{id}/versions` | `{version, reason, effective_from?, effective_until?, supersede_version?, manifest?, strict?}` | supersede: new version + reason; the old (default: current valid) transitions to `superseded` with derived window end; a new manifest passes the same intake checks |
 | `POST /applicability` | `{profile_id, product_type, effective_from?, effective_until?, retroactive?, register?, profile_version?}` | dated applicability binding (profile item must exist, class `profile`) |
+| `POST /applicability` | `{product_type, at?, subject_facts}` | *evaluation* form (no `profile_id`): same clock-predicate evaluation as the GET |
+| `POST /models` | `{register_id, item_id, definition, version, source, effective_from?, submitting_organization?}` | deposit an EXPRESS model: content hash over the exact bytes + expressir validation; `invalid` sources are rejected, absent expressir stores `pending` |
+| `POST /models/{id}/validate` | — | re-run expressir validation over the stored source (the `pending` → `valid`/`invalid` path) and record the outcome |
 | `GET /admin/log?limit=&offset=` | — | the append-only audit log |
 
 Each subregister mounts the same surface class-scoped:
@@ -105,7 +112,40 @@ Each subregister mounts the same surface class-scoped:
 `POST /{subregister}/{id}/versions`,
 `GET /{subregister}/{id}/supersession` — where `{subregister}` is one
 of `data-elements`, `profiles`, `crypto-suites`, `transforms`,
-`trust-anchors`, `units`.
+`trust-anchors`, `units`, `cross-register-mappings` (the `models`
+subregister has the dedicated `/models` surface above).
+
+## v3 intake checks and clock predicates
+
+`POST /items` runs a chain of class-scoped intake checks (each a
+pure function on the manifest; extend by implementing
+`IntakeCheck`, not by editing handlers):
+
+| Check | Class | Rule |
+|---|---|---|
+| `profile-manifest-schema` | profile | the manifest validates against the served JSON Schema (draft 2020-12, generated from `src/manifest.rs` — one source, two renders) |
+| `profile-satisfiability` | profile | data points demanding `min_capability` above the declared `subject_capability`, or bounded `fresh_within` on an S0/S1 subject, are unsatisfiable (I8 ladder: S0 silent, S1 passive-auth, S2 logged-contact, S3 connected) — reject, or warn with `strict=false` |
+| `cross-register-mapping-integrity` | cross-register-mapping | both ends of `{source, target}` must resolve to registered items (register attribute matching, version pins existing) |
+
+Clock predicates (`{predicate_class: "time", basis:
+"manufactured_at"|"first_registered_at", operator: ">="|">"|"<="|"<",
+duration: "P40Y"}`) are evaluated by the applicability endpoint at
+the query instant: the predicate fires once `at <operator> basis +
+duration` (calendar-aware ISO 8601 duration arithmetic). The
+doctrinal case: manufactured 1962-05-04, `P40Y` → the historic
+vehicle profile binds from 2002-05-04. Fact predicates remain the
+subject custodian's concern — the registry evaluates only what the
+passage of time alone makes computable.
+
+**expressir dependency** (EXPRESS validation): `gem install
+expressir`, binary on `PATH` (validated with expressir 2.4.0; the
+CLI is invoked as `expressir validate load <temp-file>`). Without
+it, model deposits are stored with `validation.status = "pending"`
+and can be validated later via `POST /models/{id}/validate`. The
+serving binary deposits the vendored UniDPP EXPRESS core schema
+(`assets/unidpp-core.express`, sourced from unidpp-express) as its
+first model item on start (idempotent; disable with
+`UNIDPP_REGISTRY_SEED_EXPRESS=0`).
 
 ## Discovery registry (v2) — C3 / C4 / C5
 

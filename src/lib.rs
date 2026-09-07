@@ -33,17 +33,31 @@
 #![allow(clippy::result_large_err)]
 
 pub mod api;
+pub mod clock;
 pub mod discovery;
+pub mod express;
+pub mod intake;
+pub mod manifest;
+pub mod mapping;
 pub mod model;
+pub mod satisfiability;
+pub mod schema;
 pub mod store;
 pub mod time;
 
 pub use api::{run, Config, TestServer};
+pub use clock::{parse_duration, ClockEvaluation, Duration, TimeTrigger};
 pub use discovery::{
     key_id, operator_id, operator_public_key, operator_record, sign_body, DiscoveryError, Endpoint,
     OperatorKeyring, OperatorRef, ProtocolBinding, ServiceClass, ServiceDescriptor, ServiceStatus,
     ServiceVersion, SignatureValue, VerificationMechanism,
 };
+pub use express::{content_hash, expressir_available, ValidationRecord, ValidationStatus};
+pub use intake::{default_chain, IntakeCheck, IntakeContext, IntakeError, IntakeWarning};
+pub use manifest::{profile_manifest_schema, validate_manifest, ProfileManifest};
+pub use mapping::{cross_register_mapping_schema, CrossRegisterMapping};
 pub use model::{ApplicabilityBinding, Item, ItemClass, ItemVersion, Status};
+pub use satisfiability::{check as check_satisfiability, Violation as SatisfiabilityViolation};
+pub use schema::{validate as validate_schema, SchemaError};
 pub use store::{AuditRecord, Op, Store, StoreError};
 pub use time::Timestamp;

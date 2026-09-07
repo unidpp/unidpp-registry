@@ -57,6 +57,15 @@ pub enum Op {
     RegisterProtocolBinding { binding: ProtocolBinding },
     /// A C5 verification mechanism.
     RegisterVerificationMechanism { mechanism: VerificationMechanism },
+    /// Re-validated the EXPRESS source of a `model` item's version:
+    /// the manifest's `express.validation` block is replaced.
+    UpdateModelValidation {
+        identifier: String,
+        version: String,
+        status: String,
+        tool: String,
+        detail: Option<String>,
+    },
 }
 
 /// One record in the append-only audit log.
@@ -119,6 +128,27 @@ impl AuditRecord {
                 "op": "register-verification-mechanism",
                 "mechanism": mechanism.to_json(),
             }),
+            Op::UpdateModelValidation {
+                identifier,
+                version,
+                status,
+                tool,
+                detail,
+            } => {
+                let mut m = json!({
+                    "op": "update-model-validation",
+                    "identifier": identifier,
+                    "version": version,
+                    "status": status,
+                    "tool": tool,
+                });
+                if let Some(d) = detail {
+                    if let Some(o) = m.as_object_mut() {
+                        o.insert("detail".into(), json!(d));
+                    }
+                }
+                m
+            }
         }
         .as_object()
         .cloned()
@@ -205,6 +235,32 @@ impl AuditRecord {
                 mechanism: VerificationMechanism::from_json_value(
                     obj.get("mechanism").ok_or("missing `mechanism`")?,
                 )?,
+            },
+            Some("update-model-validation") => Op::UpdateModelValidation {
+                identifier: obj
+                    .get("identifier")
+                    .and_then(Value::as_str)
+                    .ok_or("missing `identifier`")?
+                    .to_string(),
+                version: obj
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .ok_or("missing `version`")?
+                    .to_string(),
+                status: obj
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .ok_or("missing `status`")?
+                    .to_string(),
+                tool: obj
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .ok_or("missing `tool`")?
+                    .to_string(),
+                detail: obj
+                    .get("detail")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
             },
             _ => return Err("unknown `op`".to_string()),
         };
@@ -365,6 +421,29 @@ impl Store {
             Op::RegisterVerificationMechanism { mechanism } => {
                 self.verification_mechanisms
                     .insert(mechanism.identifier.clone(), mechanism.clone());
+            }
+            Op::UpdateModelValidation {
+                identifier,
+                status,
+                tool,
+                detail,
+                ..
+            } => {
+                if let Some(item) = self.items.get_mut(identifier) {
+                    if let Some(manifest) = item.manifest.as_mut() {
+                        if let Some(express) = manifest.get_mut("express") {
+                            if let Some(o) = express.as_object_mut() {
+                                let mut record = serde_json::Map::new();
+                                record.insert("status".into(), json!(status));
+                                record.insert("tool".into(), json!(tool));
+                                if let Some(d) = detail {
+                                    record.insert("detail".into(), json!(d));
+                                }
+                                o.insert("validation".into(), Value::Object(record));
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -647,6 +726,40 @@ impl Store {
         Ok(self.record(Op::RegisterVerificationMechanism { mechanism }))
     }
 
+    /// Records a fresh expressir validation outcome for a `model`
+    /// item's version (appended to the audit log; the manifest's
+    /// `express.validation` block is replaced on apply).
+    pub fn update_model_validation(
+        &mut self,
+        identifier: &str,
+        version: &str,
+        record: &crate::express::ValidationRecord,
+    ) -> Result<AuditRecord, StoreError> {
+        let Some(item) = self.items.get(identifier) else {
+            return Err(StoreError::Invalid(format!(
+                "no registry item `{identifier}`"
+            )));
+        };
+        if item.item_class != ItemClass::Model {
+            return Err(StoreError::Invalid(format!(
+                "item `{identifier}` has class `{}`, not `model`",
+                item.item_class
+            )));
+        }
+        if item.version(version).is_none() {
+            return Err(StoreError::Invalid(format!(
+                "item `{identifier}` has no version `{version}`"
+            )));
+        }
+        Ok(self.record(Op::UpdateModelValidation {
+            identifier: identifier.to_string(),
+            version: version.to_string(),
+            status: record.status.as_str().to_string(),
+            tool: record.tool.clone(),
+            detail: record.detail.clone(),
+        }))
+    }
+
     // -- audit views ------------------------------------------------------
 
     /// The append-only audit log (admin view, paged).
@@ -864,6 +977,83 @@ mod tests {
         let mut pinned = binding("p");
         pinned.profile_version = Some("9.9.9".into());
         assert!(matches!(store.bind(pinned), Err(StoreError::Invalid(_))));
+    }
+
+    fn model_item(id: &str) -> Item {
+        let rec = crate::express::ValidationRecord {
+            status: crate::express::ValidationStatus::Pending,
+            tool: "expressir".to_string(),
+            detail: Some("not available".to_string()),
+        };
+        Item {
+            identifier: id.to_string(),
+            register: "unidpp-dev".to_string(),
+            item_class: ItemClass::Model,
+            title: "express model".to_string(),
+            submitting_organization: None,
+            versions: vec![ItemVersion {
+                version: "1.0.0".to_string(),
+                status: Status::Valid,
+                effective_from: Some(ts("2026-01-01T00:00:00Z")),
+                effective_until: None,
+                registered_at: Some(ts("2026-09-07T00:00:00Z")),
+                superseded_by_version: None,
+                notes: None,
+            }],
+            manifest: Some(crate::express::model_manifest(
+                "1.0.0",
+                "SCHEMA m '1.0.0'; END_SCHEMA;",
+                &rec,
+            )),
+        }
+    }
+
+    #[test]
+    fn update_model_validation_replaces_the_record_and_journals() {
+        let dir = std::env::temp_dir().join(format!("unidpp-registry-mv-{}", std::process::id()));
+        let path = dir.join("audit.jsonl");
+        let _ = std::fs::remove_file(&path);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let mut store = Store::open(Some(&path)).unwrap();
+            store.register_item(model_item("m")).unwrap();
+            let rec = crate::express::ValidationRecord {
+                status: crate::express::ValidationStatus::Valid,
+                tool: "expressir".to_string(),
+                detail: None,
+            };
+            store.update_model_validation("m", "1.0.0", &rec).unwrap();
+            let manifest = store.item("m").unwrap().manifest.clone().unwrap();
+            assert_eq!(manifest["express"]["validation"]["status"], "valid");
+            // wrong class / unknown item / unknown version are rejected
+            store
+                .register_item(profile_item("p", "1.0.0", "2026-01-01T00:00:00Z"))
+                .unwrap();
+            assert!(matches!(
+                store.update_model_validation("p", "1.0.0", &rec),
+                Err(StoreError::Invalid(_))
+            ));
+            assert!(matches!(
+                store.update_model_validation("nope", "1.0.0", &rec),
+                Err(StoreError::Invalid(_))
+            ));
+            assert!(matches!(
+                store.update_model_validation("m", "9.9.9", &rec),
+                Err(StoreError::Invalid(_))
+            ));
+            // register m + update m + register p (the wrong-class probe)
+            assert_eq!(store.log_len(), 3);
+        }
+        // replay re-applies the validation update
+        let store = Store::open(Some(&path)).unwrap();
+        assert_eq!(store.log_len(), 3);
+        let manifest = store.item("m").unwrap().manifest.clone().unwrap();
+        assert_eq!(manifest["express"]["validation"]["status"], "valid");
+        assert_eq!(
+            manifest["express"]["content_hash"],
+            crate::express::content_hash("SCHEMA m '1.0.0'; END_SCHEMA;")
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

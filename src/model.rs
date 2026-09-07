@@ -44,16 +44,25 @@ pub enum ItemClass {
     Transform,
     TrustAnchor,
     Unit,
+    /// A deposited EXPRESS (or CDDAL) semantic model: source text +
+    /// content hash + expressir validation status (item 58 / T-08).
+    /// Deposited through the dedicated `POST /models` surface.
+    Model,
+    /// A mapping between items of two registers, itself a registered
+    /// item (item 57 / T-07, ISO 19135 harmonization).
+    CrossRegisterMapping,
 }
 
 impl ItemClass {
-    pub const ALL: [ItemClass; 6] = [
+    pub const ALL: [ItemClass; 8] = [
         ItemClass::DataElement,
         ItemClass::Profile,
         ItemClass::CryptoSuite,
         ItemClass::Transform,
         ItemClass::TrustAnchor,
         ItemClass::Unit,
+        ItemClass::Model,
+        ItemClass::CrossRegisterMapping,
     ];
 
     /// Canonical (singular) class name, as stored on the item.
@@ -65,6 +74,8 @@ impl ItemClass {
             ItemClass::Transform => "transform",
             ItemClass::TrustAnchor => "trust-anchor",
             ItemClass::Unit => "unit",
+            ItemClass::Model => "model",
+            ItemClass::CrossRegisterMapping => "cross-register-mapping",
         }
     }
 
@@ -78,12 +89,16 @@ impl ItemClass {
             ItemClass::Transform => "transforms",
             ItemClass::TrustAnchor => "trust-anchors",
             ItemClass::Unit => "units",
+            ItemClass::Model => "models",
+            ItemClass::CrossRegisterMapping => "cross-register-mappings",
         }
     }
 
-    /// Parses a class name in singular or plural form.
+    /// Parses a class name in singular or plural form. Underscore
+    /// spellings (`cross_register_mapping`) normalize to the
+    /// canonical hyphen form.
     pub fn parse(input: &str) -> Option<ItemClass> {
-        let t = input.trim();
+        let t = input.trim().replace('_', "-");
         ItemClass::ALL
             .into_iter()
             .find(|c| c.as_str() == t || c.plural() == t)
@@ -605,6 +620,28 @@ mod tests {
         assert_eq!(ItemClass::parse("bogus"), None);
         assert_eq!(ItemClass::Profile.plural(), "profiles");
         assert_eq!(ItemClass::TrustAnchor.as_str(), "trust-anchor");
+        // the v3 classes, in hyphen and underscore spellings, both
+        // numbers
+        assert_eq!(ItemClass::parse("model"), Some(ItemClass::Model));
+        assert_eq!(ItemClass::parse("models"), Some(ItemClass::Model));
+        assert_eq!(
+            ItemClass::parse("cross-register-mapping"),
+            Some(ItemClass::CrossRegisterMapping)
+        );
+        assert_eq!(
+            ItemClass::parse("cross_register_mapping"),
+            Some(ItemClass::CrossRegisterMapping)
+        );
+        assert_eq!(
+            ItemClass::parse("cross-register-mappings"),
+            Some(ItemClass::CrossRegisterMapping)
+        );
+        assert_eq!(ItemClass::Model.plural(), "models");
+        assert_eq!(
+            ItemClass::CrossRegisterMapping.plural(),
+            "cross-register-mappings"
+        );
+        assert_eq!(ItemClass::ALL.len(), 8);
     }
 
     #[test]

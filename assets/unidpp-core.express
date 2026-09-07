@@ -1,0 +1,703 @@
+(*
+Vendored copy of the UniDPP EXPRESS core model for the registry's
+first model deposit (TODO item 58 / T-08).
+
+Provenance: github.com/unidpp/unidpp-express schema.unidpp.express
+(SCHEMA UNIDPP_CORE). This copy is the registry's deposit artifact;
+the canonical source lives in unidpp-express. Re-vendor with:
+  cp ../unidpp-express/schema.unidpp.express assets/unidpp-core.express
+(the provenance header above is prepended by hand).
+
+The content hash the registry records pins exactly this copy.
+*)
+
+(*
+ISO/IEC JTC 5 / UniDPP — EXPRESS core model for the Digital Product Passport.
+
+Schema:   UNIDPP_CORE
+Version:  0.1.0
+Date:     2026-09-07
+
+Purpose: the formal, machine-parsable statement of the UniDPP core
+model — the counter-proposal to "three representations, prose wins"
+(EN 18223 4.1.1). The executable twin of this schema is the Rust
+crate `unidpp-model` in github.com/unidpp/unidpp-core
+(crates/model/src/); see README.md for the entity-by-entity mapping.
+
+Scope (UniDPP design framework):
+  - the minimal DataElement tree (L3 semantic registry layer);
+  - Passport and the typed relationship algebra R1-R7 (I5);
+  - the identity lattice: manufacturer (actor, not a level), model,
+    type version, configuration vector, instance (7.4);
+  - provenance classes: declared / measured / computed (6.7 d);
+  - graded trust markers and multi-suite signature framing (I9);
+  - the event/relationship surface: post-sale event classes E1-E15,
+    transformation, structural and edge-visibility events, and the
+    passport status machine with defined transitions (I6).
+
+Lineage: the identity lattice and configuration-management semantics
+follow the configuration-management discipline of ISO 10303-242
+(AP242, managed model based 3D engineering) — product occurrences
+referencing exactly-versioned product definitions — re-expressed for
+passport identity rather than CAD product structure.
+
+Conventions:
+  - Timestamps are canonical UTC ISO 8601 strings with trailing 'Z'
+    (Rust `time.rs`); EXPRESS has no native datetime type.
+  - Where the Rust enums are open (`Known(..) | Other(String)`), this
+    schema uses a closed enumeration plus an optional extension tag
+    (`*_other` / `other_tag`) constrained by a WHERE rule.
+  - The `m_` / `a_` prefixes on installation-method and alteration
+    enumeration values disambiguate the shared namespace of
+    enumeration values (Rust `KnownMethod` and `KnownAlteration`
+    overlap); wire tokens map as `m_torque_to_yield` <->
+    `torque-to-yield` etc.
+*)
+
+SCHEMA UNIDPP_CORE '0.1.0';
+
+-- ============================================================ --
+-- Scalar domains
+-- ============================================================ --
+
+TYPE timestamp = STRING;
+  -- Canonical UTC ISO 8601 with trailing 'Z'; Rust time.rs Timestamp.
+END_TYPE;
+
+TYPE passport_identifier = STRING;
+  -- Rust ids.rs PassportId: location-free slug / URN form,
+  -- normalized lowercase, <= 128 characters (I14: identities outlive
+  -- their issuers and hosts).
+WHERE
+  length_ok : (LENGTH(SELF) > 0) AND (LENGTH(SELF) <= 128);
+  no_whitespace : NOT (' ' IN SELF);
+END_TYPE;
+
+-- Fact values on the twin state (Rust facts.rs FactValue). EXPRESS
+-- selects admit defined types only, hence the wrappers.
+
+TYPE fact_string = STRING;
+END_TYPE;
+
+TYPE fact_number = NUMBER;
+END_TYPE;
+
+TYPE fact_boolean = BOOLEAN;
+END_TYPE;
+
+TYPE fact_string_list = LIST [0:?] OF STRING;
+END_TYPE;
+
+TYPE fact_value = SELECT
+  (fact_string, fact_number, fact_boolean, fact_string_list);
+END_TYPE;
+
+-- ============================================================ --
+-- Identifier granularity and schemes (identifier.rs)
+-- ============================================================ --
+
+TYPE granularity_enum = ENUMERATION OF
+  (model, batch, item);
+  -- I3: inputs recorded at the finest identifier granularity
+  -- available; derived from scheme + lot/serial presence.
+END_TYPE;
+
+TYPE id_scheme_enum = ENUMERATION OF
+  (gtin, sgtin, gsrn, gln, cpid, ssn, upu, vin, handle, doi, uri,
+   issuer_local);
+  -- Rust IdScheme: GS1 family + ISO/IEC 15459 CPID + national
+  -- carriers; `issuer_local` is Rust `Local(tag)` with the issuer
+  -- tag carried in `scheme_tag`.
+END_TYPE;
+
+-- ============================================================ --
+-- Passport link algebra (link.rs, I5)
+-- ============================================================ --
+
+TYPE link_type_enum = ENUMERATION OF
+  (association, derivation, installation, type_lineage, profile_of,
+   custody, membership);
+  -- R1-R7. R5 profile-of is lens<->core, not a passport-to-passport
+  -- edge in the Rust core (link.rs); it is carried here for the full
+  -- algebra surface, constrained to carry no binding.
+END_TYPE;
+
+TYPE direction_enum = ENUMERATION OF
+  (outgoing, incoming);
+  -- Which side of the edge the record speaks from.
+END_TYPE;
+
+TYPE recoverability_enum = ENUMERATION OF
+  (restorable, harvestable, destructive, absorbing);
+  -- Recoverability spectrum of an installation; determines identity
+  -- continuity (identity-continuity rule, link.rs).
+END_TYPE;
+
+TYPE pairing_enum = ENUMERATION OF
+  (none, firmware, key, module);
+  -- Pairing / re-identification mode.
+END_TYPE;
+
+TYPE visibility_class_enum = ENUMERATION OF
+  (public, restricted, blind, escrowed);
+  -- Edge visibility classes (I12).
+END_TYPE;
+
+TYPE install_method_enum = ENUMERATION OF
+  (m_fastened, m_soldered, m_glued, m_welded, m_potted,
+   m_torque_to_yield, m_coated, m_keyed, m_other);
+  -- Rust KnownMethod (m_ prefix) + m_other for `other:<token>`.
+END_TYPE;
+
+TYPE alteration_enum = ENUMERATION OF
+  (a_soldered, a_glued, a_welded, a_potted, a_torque_to_yield,
+   a_conformal_coating, a_other);
+  -- Rust KnownAlteration (a_ prefix) + a_other for `other:<token>`.
+END_TYPE;
+
+TYPE identity_flow_enum = ENUMERATION OF
+  (continues_standalone, continues_harvested, to_material_passport,
+   dissolved);
+  -- Identity-flow consequence of recoverability (link.rs
+  -- IdentityFlow).
+END_TYPE;
+
+-- ============================================================ --
+-- Trust (trust.rs, I9)
+-- ============================================================ --
+
+TYPE trust_marker_enum = ENUMERATION OF
+  (unsigned, self_declared, attested, multi_signed, log_anchored);
+  -- Graded ladder; declaration order is grade order 0..4.
+END_TYPE;
+
+TYPE signature_suite_enum = ENUMERATION OF
+  (ecdsa_p256, sm2, ml_dsa_44, ml_dsa_65, ml_dsa_87);
+  -- Multi-suite co-signature model: ECDSA + SM2 + ML-DSA, so every
+  -- jurisdiction verifies under its own crypto policy.
+END_TYPE;
+
+-- ============================================================ --
+-- Provenance classes (framework 6.7 d; unidpp-cab model.rs)
+-- ============================================================ --
+
+TYPE provenance_class_enum = ENUMERATION OF
+  (declared, measured, computed);
+  -- Declared at type; measured at instance per method with
+  -- uncertainty; computed by transform. Profiles declare which
+  -- classes they accept and their precedence rules.
+END_TYPE;
+
+TYPE measurement_basis_enum = ENUMERATION OF
+  (instance_measured, type_declared);
+  -- Operator model 2.2-17: instance-measured overrides
+  -- type-declared.
+END_TYPE;
+
+-- ============================================================ --
+-- Registry lifecycle (unidpp-registry model.rs, ISO 19135)
+-- ============================================================ --
+
+TYPE registry_status_enum = ENUMERATION OF
+  (valid, superseded, retired);
+  -- Item lifecycle status; versions are immutable once registered.
+END_TYPE;
+
+-- ============================================================ --
+-- Event classes (unidpp-core crates/event event_type.rs, status.rs)
+-- ============================================================ --
+
+TYPE post_sale_event_enum = ENUMERATION OF
+  (e1_custody_transfer,
+   e2_part_replace,
+   e3_repair_perform,
+   e4_product_modify,
+   e5_software_update,
+   e6_upgrade_install,
+   e7_refurbish_remanufacture,
+   e8_consumable_replace,
+   e9_recall_campaign,
+   e10_correction,
+   e11_status_change,
+   e12_flag_security,
+   e13_decompose,
+   e14_inspection_stamp,
+   e15_milestone_record);
+  -- The post-sale taxonomy E1-E15.
+END_TYPE;
+
+TYPE auxiliary_event_enum = ENUMERATION OF
+  (transform_split,
+   transform_combine,
+   transform_end_of_waste,
+   structural_install,
+   structural_uninstall,
+   passport_issuance,
+   edge_visibility_change,
+   escrow_disclosure);
+  -- Transformation algebra, structural, passport-lifecycle and
+  -- edge-visibility classes (Rust EventType beyond E1-E15).
+END_TYPE;
+
+TYPE event_kind = SELECT
+  (post_sale_event_enum, auxiliary_event_enum);
+END_TYPE;
+
+TYPE passport_status_enum = ENUMERATION OF
+  (issued, suspended, invalidated, non_conformant, consumed,
+   transformed, end_of_waste, archived);
+  -- Normative passport statuses (I6); transitions constrained by
+  -- legal_status_transition (status.rs can_transition).
+END_TYPE;
+
+-- ============================================================ --
+-- Registry references and the DataElement tree
+-- ============================================================ --
+
+ENTITY registry_item_ref;
+  -- Item reference (register, item, version): Rust profile.rs
+  -- DataPointRef; the seam-S4 version-pinned join to the registry.
+  register : STRING;
+  item     : STRING;
+  version  : OPTIONAL STRING;
+WHERE
+  non_empty : (LENGTH(register) > 0) AND (LENGTH(item) > 0);
+END_ENTITY;
+
+ENTITY data_element;
+  -- Minimal DataElement tree (L3). One element = the single
+  -- definition (I2) of a data element in a federated register; the
+  -- tree carries containment (parent/children); versions carry the
+  -- ISO 19135 lifecycle.
+  identifier : STRING;
+  register   : STRING;
+  name       : STRING;
+  definition : STRING;
+  unit       : OPTIONAL registry_item_ref;
+  parent     : OPTIONAL data_element;
+INVERSE
+  children : SET [0:?] OF data_element FOR parent;
+  versions : SET [0:?] OF data_element_version FOR element;
+UNIQUE
+  ur : identifier, register;
+WHERE
+  defined : LENGTH(definition) > 0;
+  not_own_parent : NOT EXISTS(parent) OR (parent <> SELF);
+END_ENTITY;
+
+ENTITY data_element_version;
+  -- One immutable version of a registered data element; the open
+  -- effective window end is derived from the successor when absent
+  -- (registry model.rs window_until).
+  element         : data_element;
+  version         : STRING;
+  status          : registry_status_enum;
+  effective_from  : OPTIONAL timestamp;
+  effective_until : OPTIONAL timestamp;
+  registered_at   : OPTIONAL timestamp;
+  superseded_by   : OPTIONAL STRING;
+UNIQUE
+  ur : element, version;
+WHERE
+  ordered : NOT (EXISTS(effective_until) AND
+    (effective_until < effective_from));
+END_ENTITY;
+
+-- ============================================================ --
+-- The identity lattice (framework 7.4)
+-- ============================================================ --
+
+ENTITY manufacturer;
+  -- An actor, not a lattice level: issues type declarations and type
+  -- passports. Product line and family are registry navigation
+  -- metadata, not passport levels, and are not modelled here.
+  name       : STRING;
+  identifier : OPTIONAL product_identifier;
+WHERE
+  named : LENGTH(name) > 0;
+END_ENTITY;
+
+ENTITY product_model;
+  -- A registered type definition: the level at which the *type
+  -- passport* holds type-approved facts (certifications, type tests,
+  -- declared values). Model-contains-model defines potential
+  -- composition; instance references actual child instances.
+  model_identifier : STRING;
+  designation      : STRING;
+  manufacturer     : manufacturer;
+UNIQUE
+  ur : model_identifier;
+WHERE
+  identified : LENGTH(model_identifier) > 0;
+END_ENTITY;
+
+ENTITY type_version;
+  -- A version of a registered type definition. An instance passport
+  -- references its type AND the exact type version (hardware
+  -- revisions visible, eliminating the silent-revision problem).
+  -- Configuration-management lineage follows AP242 discipline.
+  model           : product_model;
+  version         : STRING;
+  effective_from  : OPTIONAL timestamp;
+  effective_until : OPTIONAL timestamp;
+UNIQUE
+  ur : model, version;
+WHERE
+  ordered : NOT (EXISTS(effective_until) AND
+    (effective_until < effective_from));
+END_ENTITY;
+
+ENTITY configuration_vector;
+  -- A configure-to-order product is model plus configuration vector;
+  -- each option is itself a registered component model with its own
+  -- passport, composing through the same child-reference mechanism
+  -- as any composite.
+  model   : product_model;
+  options : LIST [1:?] OF product_model;
+END_ENTITY;
+
+ENTITY product_instance;
+  -- An individual / batch subject. One-offs and prototypes are
+  -- instance passports with nullable type reference (7.4 e).
+  identifiers   : LIST [1:?] OF product_identifier;
+  type_ref      : OPTIONAL product_model;
+  type_version  : OPTIONAL type_version;
+  configuration : OPTIONAL configuration_vector;
+WHERE
+  version_needs_type : NOT EXISTS(type_version) OR EXISTS(type_ref);
+END_ENTITY;
+
+ENTITY product_identifier;
+  -- Scheme-agnostic product identifier (ISO/IEC 15459 / EN 18219
+  -- style): scheme + key + optional lot/serial extensions, with
+  -- derived granularity. Canonical display: GS1 element string
+  -- `01+K[+10+L][+21+S]`, scheme-prefixed lowercase otherwise.
+  scheme       : id_scheme_enum;
+  scheme_tag   : OPTIONAL STRING;
+  key          : STRING;
+  lot          : OPTIONAL STRING;
+  serial       : OPTIONAL STRING;
+  granularity  : granularity_enum;
+WHERE
+  key_non_empty : LENGTH(key) > 0;
+  local_tagged : (scheme = issuer_local) = EXISTS(scheme_tag);
+  granularity_derived : granularity =
+    derived_granularity(scheme, EXISTS(lot), EXISTS(serial));
+  lot_non_empty : NOT EXISTS(lot) OR (LENGTH(lot) > 0);
+  serial_non_empty : NOT EXISTS(serial) OR (LENGTH(serial) > 0);
+END_ENTITY;
+
+-- ============================================================ --
+-- Passport and the link algebra
+-- ============================================================ --
+
+ENTITY passport;
+  -- A passport: one per placed-on-market product identity (a
+  -- composite product is a federation of passports, not one
+  -- mega-passport, 7.4 h). Type passports attach at model level;
+  -- instance/batch/item passports attach at instance level.
+  id               : passport_identifier;
+  status           : passport_status_enum;
+  issued_at        : timestamp;
+  subject_instance : OPTIONAL product_instance;
+  subject_model    : OPTIONAL product_model;
+INVERSE
+  links       : SET [0:?] OF passport_link FOR owner;
+  data_points : SET [0:?] OF data_point FOR passport;
+  events      : SET [0:?] OF event FOR subject;
+  signatures  : SET [0:?] OF sig_slot FOR passport;
+UNIQUE
+  ur : id;
+WHERE
+  one_subject : EXISTS(subject_instance) XOR EXISTS(subject_model);
+END_ENTITY;
+
+ENTITY passport_link;
+  -- A typed relationship edge held by one passport (I5):
+  -- {type, direction, interval, binding}. Interval closure is
+  -- explicit (an uninstall or removal event closes the interval);
+  -- activity at a time is interval containment, an open interval
+  -- remaining active into the future.
+  owner      : passport;
+  link_type  : link_type_enum;
+  other      : passport;
+  direction  : direction_enum;
+  interval   : interval;
+  binding    : OPTIONAL binding;
+WHERE
+  installation_requires_binding : (link_type <> installation) OR
+    EXISTS(binding);
+  navigational_edges_unbound :
+    ((link_type <> association) AND (link_type <> profile_of)) OR
+    NOT EXISTS(binding);
+END_ENTITY;
+
+ENTITY interval;
+  -- [start, finish] with optional open end ("ongoing"): Rust
+  -- time.rs Interval (half-closed semantics per contains()).
+  start  : timestamp;
+  finish : OPTIONAL timestamp;
+WHERE
+  ordered : NOT EXISTS(finish) OR (finish >= start);
+END_ENTITY;
+
+ENTITY binding;
+  -- Installation binding (R3): {method, recoverability, visibility,
+  -- slotId, pairing, alteration[]}. Installation is its own event
+  -- class, not generic containment.
+  method         : install_method_enum;
+  method_other   : OPTIONAL STRING;
+  recoverability : recoverability_enum;
+  visibility     : visibility;
+  slot_id        : OPTIONAL STRING;
+  pairing        : pairing_enum;
+  alterations    : LIST [0:?] OF alteration;
+WHERE
+  method_extension : (method = m_other) = EXISTS(method_other);
+END_ENTITY;
+
+ENTITY alteration;
+  -- A permanent alteration performed on the installed child.
+  kind      : alteration_enum;
+  other_tag : OPTIONAL STRING;
+WHERE
+  alteration_extension : (kind = a_other) = EXISTS(other_tag);
+END_ENTITY;
+
+ENTITY visibility;
+  -- Edge visibility: {edge, escrow trustee, audiences} (I12;
+  -- enumeration resistance). Consumer edges are personal data:
+  -- blind is the default and an escrow envelope is optional.
+  edge      : visibility_class_enum;
+  escrow    : OPTIONAL STRING;
+  audiences : LIST [0:?] OF STRING;
+WHERE
+  escrowed_needs_trustee : (edge <> escrowed) OR EXISTS(escrow);
+  public_carries_no_audience :
+    (edge <> public) OR (SIZEOF(audiences) = 0);
+END_ENTITY;
+
+-- ============================================================ --
+-- Passport content: data points with provenance and trust
+-- ============================================================ --
+
+ENTITY data_point;
+  -- One value on a passport: the element reference (register, item,
+  -- version), the fact value, the provenance object and the trust
+  -- marker. Children join by identity reference, never by data
+  -- copying; roll-up views are computed from references (9.1).
+  passport   : passport;
+  element    : registry_item_ref;
+  fact       : fact_value;
+  provenance : provenance;
+  trust      : trust_marker_enum;
+UNIQUE
+  ur : passport, element, provenance;
+END_ENTITY;
+
+ENTITY provenance
+  ABSTRACT SUPERTYPE OF (ONEOF (declared_provenance,
+    measured_provenance, computed_provenance));
+  -- The provenance classes (6.7 d). The class is determined by the
+  -- subtype; provenance_class_enum states the vocabulary.
+END_ENTITY;
+
+ENTITY declared_provenance SUBTYPE OF (provenance);
+  -- Declared at type (manufacturer's type declaration).
+  declared_by  : manufacturer;
+  declaration  : STRING;
+  declared_at  : timestamp;
+END_ENTITY;
+
+ENTITY measured_provenance SUBTYPE OF (provenance);
+  -- Measured at instance per method with uncertainty (GUM,
+  -- JCGM 100); basis instance_measured overrides type_declared.
+  method       : method_citation;
+  uncertainty  : gum_uncertainty;
+  unit         : OPTIONAL registry_item_ref;
+  basis        : measurement_basis_enum;
+  performed_by : OPTIONAL STRING;
+  measured_at  : timestamp;
+END_ENTITY;
+
+ENTITY computed_provenance SUBTYPE OF (provenance);
+  -- Computed by a registered transform (unidpp-transform; the R2
+  -- transformation algebra governs derivation edges).
+  transform    : registry_item_ref;
+  algorithm    : STRING;
+  computed_at  : timestamp;
+END_ENTITY;
+
+ENTITY method_citation;
+  -- The test/measurement method the value followed, e.g.
+  -- 'IEC 61960-3:2019'.
+  citation        : STRING;
+  clause          : OPTIONAL STRING;
+  registered_ref  : OPTIONAL registry_item_ref;
+WHERE
+  cited : LENGTH(citation) > 0;
+END_ENTITY;
+
+ENTITY gum_uncertainty;
+  -- value +- expanded U with coverage factor k (JCGM 100 / GUM).
+  expanded_uncertainty : REAL;
+  coverage_factor      : REAL;
+  coverage_probability : OPTIONAL REAL;
+WHERE
+  non_negative : expanded_uncertainty >= 0;
+  factor_positive : coverage_factor > 0;
+  probability_in_range : NOT EXISTS(coverage_probability) OR
+    ((coverage_probability > 0) AND (coverage_probability < 1));
+END_ENTITY;
+
+-- ============================================================ --
+-- Trust markers and signature framing (I9)
+-- ============================================================ --
+
+ENTITY sig_slot;
+  -- One framed signature slot: suite, key id, signature bytes. An
+  -- absent signature marks a placeholder that the signing layer
+  -- fills; budgeting always reserves the suite's canonical
+  -- signature length (ECDSA/SM2 r||s 64 bytes; ML-DSA per FIPS 204).
+  passport  : passport;
+  suite     : signature_suite_enum;
+  key_id    : STRING;
+  signature : OPTIONAL BINARY;
+UNIQUE
+  ur : passport, key_id;
+END_ENTITY;
+
+-- ============================================================ --
+-- The event surface (E1-E15, auxiliary classes, status machine)
+-- ============================================================ --
+
+ENTITY event;
+  -- An event in the passport's append-only history. Every event
+  -- carries a trust marker; the taxonomy fixes who appends
+  -- (actor_role mirrors event_type.rs appender_role).
+  subject    : passport;
+  kind       : event_kind;
+  at         : timestamp;
+  actor_role : STRING;
+  trust      : trust_marker_enum;
+END_ENTITY;
+
+ENTITY status_change_event SUBTYPE OF (event);
+  -- The E11 status change with its transition payload; the
+  -- transition must be legal per the status machine (I6).
+  previous : passport_status_enum;
+  next     : passport_status_enum;
+WHERE
+  legal_transition : legal_status_transition(previous, next);
+END_ENTITY;
+
+-- ============================================================ --
+-- Functions
+-- ============================================================ --
+
+FUNCTION derived_granularity(scheme : id_scheme_enum; has_lot : BOOLEAN;
+    has_serial : BOOLEAN) : granularity_enum;
+  -- identifier.rs recompute_granularity: serial => item; lot =>
+  -- batch; else the scheme default (gtin/gln/handle/doi/uri/local
+  -- default to model, the rest to item).
+  IF has_serial THEN
+    RETURN (item);
+  END_IF;
+  IF has_lot THEN
+    RETURN (batch);
+  END_IF;
+  IF (scheme = gtin) OR (scheme = gln) OR (scheme = handle) OR
+     (scheme = doi) OR (scheme = uri) OR (scheme = issuer_local) THEN
+    RETURN (model);
+  END_IF;
+  RETURN (item);
+END_FUNCTION;
+
+FUNCTION legal_status_transition(prev : passport_status_enum;
+    next : passport_status_enum) : BOOLEAN;
+  -- status.rs can_transition: suspend / invalidate / de-conform /
+  -- consume / transform / archive from issued; reinstate
+  -- (suspended -> issued); re-evaluation pass (non-conformant ->
+  -- issued); end-of-waste re-entry; archival from terminal states.
+  IF (prev = issued) AND ((next = suspended) OR (next = invalidated) OR
+      (next = non_conformant) OR (next = consumed) OR
+      (next = transformed) OR (next = end_of_waste) OR
+      (next = archived)) THEN
+    RETURN (TRUE);
+  END_IF;
+  IF (prev = suspended) AND ((next = issued) OR (next = invalidated)) THEN
+    RETURN (TRUE);
+  END_IF;
+  IF (prev = non_conformant) AND ((next = issued) OR
+      (next = invalidated)) THEN
+    RETURN (TRUE);
+  END_IF;
+  IF (prev = end_of_waste) AND ((next = issued) OR (next = archived)) THEN
+    RETURN (TRUE);
+  END_IF;
+  IF ((prev = consumed) OR (prev = transformed) OR
+      (prev = invalidated)) AND (next = archived) THEN
+    RETURN (TRUE);
+  END_IF;
+  RETURN (FALSE);
+END_FUNCTION;
+
+FUNCTION trust_grade(marker : trust_marker_enum) : INTEGER;
+  -- trust.rs: numeric grade 0..4 on the ladder; declaration order
+  -- is grade order.
+  IF marker = unsigned THEN
+    RETURN (0);
+  END_IF;
+  IF marker = self_declared THEN
+    RETURN (1);
+  END_IF;
+  IF marker = attested THEN
+    RETURN (2);
+  END_IF;
+  IF marker = multi_signed THEN
+    RETURN (3);
+  END_IF;
+  RETURN (4);
+END_FUNCTION;
+
+FUNCTION trust_of(sig_count : INTEGER; suite_count : INTEGER;
+    third_party : BOOLEAN; anchored : BOOLEAN) : trust_marker_enum;
+  -- trust.rs TrustMarker::of: derive the marker from signing
+  -- evidence.
+  IF anchored THEN
+    RETURN (log_anchored);
+  END_IF;
+  IF (suite_count >= 2) AND (sig_count >= 2) THEN
+    RETURN (multi_signed);
+  END_IF;
+  IF third_party AND (sig_count >= 1) THEN
+    RETURN (attested);
+  END_IF;
+  IF sig_count >= 1 THEN
+    RETURN (self_declared);
+  END_IF;
+  RETURN (unsigned);
+END_FUNCTION;
+
+FUNCTION identity_flow_of(r : recoverability_enum) : identity_flow_enum;
+  -- Identity-continuity rule (link.rs identity_flow): disassembly
+  -- restores a marketable object with identity continuity -> R3;
+  -- identity dissolves -> R2.
+  IF r = restorable THEN
+    RETURN (continues_standalone);
+  END_IF;
+  IF r = harvestable THEN
+    RETURN (continues_harvested);
+  END_IF;
+  IF r = destructive THEN
+    RETURN (to_material_passport);
+  END_IF;
+  RETURN (dissolved);
+END_FUNCTION;
+
+FUNCTION marketable_identity_continues(r : recoverability_enum) : BOOLEAN;
+  -- link.rs Binding::marketable_identity_continues.
+  RETURN ((r = restorable) OR (r = harvestable));
+END_FUNCTION;
+
+END_SCHEMA;
