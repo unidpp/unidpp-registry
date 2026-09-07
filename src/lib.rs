@@ -33,6 +33,7 @@
 #![allow(clippy::result_large_err)]
 
 pub mod api;
+pub mod cddal;
 pub mod clock;
 pub mod discovery;
 pub mod express;
@@ -46,6 +47,10 @@ pub mod store;
 pub mod time;
 
 pub use api::{run, Config, TestServer};
+pub use cddal::{
+    negotiate as negotiate_representation, parse as parse_cddal, render as render_cddal,
+    Representation, TermEntry, VersionEntry, FALLBACK_HEADER, FALLBACK_VALUE, MEDIA_TYPE,
+};
 pub use clock::{parse_duration, ClockEvaluation, Duration, TimeTrigger};
 pub use discovery::{
     key_id, operator_id, operator_public_key, operator_record, sign_body, DiscoveryError, Endpoint,

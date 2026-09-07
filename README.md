@@ -87,6 +87,7 @@ Public (reads):
 | `GET /` | discovery document (endpoints, classes, subregisters, conventions) |
 | `GET /healthz` | liveness |
 | `GET /items?class=&register=&at=` | list items (class/register scoped), each with its resolved version |
+| `GET /items` / `GET /{subregister}` with `Accept: text/cddal` | the same collection reads in the canonical CDDAL plain-text dictionary form (see "CDDAL serialization"); JSON is the default and the fallback |
 | `GET /items/{id}?at=&register=` | the item + the version in force at `at` (null before its first window); without `at` the current registered version |
 | `GET /items/{id}/supersession?from=` | the supersession chain (to the terminal version) |
 | `GET /applicability?product_type=&at=&subject_facts=` | which profiles applied to the product type at `at`; with `subject_facts` (a URL-encoded JSON object) clock predicates on the bound profiles are evaluated at `at` (entries whose triggers cannot fire yet are excluded; time-triggered bindings without facts are listed under `unresolved`) |
@@ -114,6 +115,71 @@ Each subregister mounts the same surface class-scoped:
 of `data-elements`, `profiles`, `crypto-suites`, `transforms`,
 `trust-anchors`, `units`, `cross-register-mappings` (the `models`
 subregister has the dedicated `/models` surface above).
+
+## CDDAL serialization (T-06)
+
+Exchange between semantic-registry hosts uses **CDDAL** — the
+IEC 61360 / ISO/IEC 62656 dictionary plain-text form (OpenCDD's
+grammar as the reference) — with a normative canonicalization rule:
+two mirrors of the same item set serve byte-identical forms, so
+cross-host comparison and audit reduce to hashing. The collection
+reads (`GET /items` and every subregister listing) honour `Accept:
+text/cddal` with this canonical form (`src/cddal.rs`); the model is
+the single source — the serializer walks the item model, and a
+strict parser reads the form back into the same projection (the
+canonicalization round trip, proven by tests).
+
+One `TERM` block per item, fields in a fixed canonical order:
+
+```text
+TERM urn:untded:de:1000
+  register: untded
+  class: data-element
+  name: Document name
+  definition: The name of the document.
+  submitting_organization: UNTDED 2005 (ECE/TRADE/362)
+  representation: an..35
+  version: 1.0.0
+  status: valid
+  effective_from: 2005-01-01T00:00:00Z
+  registered_at: 2026-09-07T00:00:00Z
+END
+```
+
+Canonicalization rules: LF line endings; `TERM <identifier>` …
+`END`; present fields in the order `irdi, register, class, name,
+definition, submitting_organization, representation, unit,
+unit_symbol, version, status, effective_from, registered_at`
+(two-space indent, `key: value`); items in the store's canonical
+listing order (identifier-sorted); values are single logical lines
+with `\`, LF and CR escaped (`\\`, `\n`, `\r`); the version is the
+*resolved* one (`in_force_at` with `?at=`, else the current
+registered version — the same rule as the JSON view); **no serving
+metadata in the body** — the as-of stamp rides in the `x-as-of`
+header only, so two reads of the same state are byte-identical.
+Dictionary slots come from the item model plus the class-scoped
+manifest keys: `irdi` and `name` (any class); `representation`
+(data elements, the raw `an..35`-style notation); `unit`
+(data elements: `unit` / `required_unit` / `unit_ref`); `unit_symbol`
+(units).
+
+Negotiation: absent `Accept`, or one listing a servable type
+(`application/json`, `*/*`), serves JSON silently; a listed
+`text/cddal` (parameters and case tolerated, q-values not weighted)
+serves CDDAL; an `Accept` listing **nothing** servable (e.g.
+`application/xml`) falls back to JSON with the warning header
+`x-content-negotiation: unknown-accept-fallback`, so callers can
+detect the silent degradation.
+
+**Coverage boundary (honest scope):** a full OpenCDD grammar is out
+of scope. Not serialized: the version history and supersession
+chains (only the resolved version is emitted — history stays in the
+JSON form), manifests beyond the named keys above (profile
+manifests, EXPRESS deposit bodies, mapping manifests stay JSON-only),
+applicability bindings, and the discovery layer (C3/C4/C5
+descriptors). JSON remains the full-fidelity form; CDDAL is the
+canonical exchange projection of the dictionary slots.
+Single-item reads (`GET /items/{id}`) stay JSON.
 
 ## v3 intake checks and clock predicates
 
@@ -307,7 +373,7 @@ rendered on every version, ignored on input).
 
 ```
 cargo build # zero warnings
-cargo test # 29 unit + 13 integration tests, zero warnings
+cargo test # 75 unit + 24 integration tests, zero warnings
 cargo clippy # clean
 ```
 
@@ -332,7 +398,12 @@ supersession with as-of windows, protocol bindings and verification
 mechanisms (register/list/get/duplicate/missing fields), the seed
 dataset (counts, contents, units with ISO 80000 citations, audit-log
 coverage), discovery journal replay across restarts, and admin auth
-on all new mutation endpoints.
+on all new mutation endpoints — and the CDDAL paths: JSON default,
+`text/cddal` served with the right content type, the
+canonicalization round trip over HTTP (the served form parses back
+into the term entries projected from the registered items),
+byte-determinism across two calls, and the unknown-Accept fallback
+header.
 
 ## Deviations from the Ruby reference (documented)
 

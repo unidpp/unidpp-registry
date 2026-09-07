@@ -269,6 +269,21 @@ pub async fn get(url: &str) -> HttpResponse {
     json_request("GET", url, None, None).await
 }
 
+/// GET with explicit request headers (content-negotiation tests).
+/// Each test binary compiles this module separately; not every
+/// binary exercises it.
+#[allow(dead_code)]
+pub async fn get_with_headers(url: &str, headers: &[(&str, &str)]) -> HttpResponse {
+    let url = Url::parse(url).expect("test URL");
+    let hs = headers
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect::<Vec<_>>();
+    request("GET", &url, &hs, None, Duration::from_secs(5))
+        .await
+        .expect("http request")
+}
+
 pub fn enc(s: &str) -> String {
     Url::encode_query_component(s)
 }

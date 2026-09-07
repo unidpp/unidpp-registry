@@ -15,7 +15,11 @@
 //! same endpoints, class-scoped. Two classes have dedicated
 //! surfaces: `/models` (EXPRESS deposits with content hash and
 //! expressir validation) and `/schemas/profile-manifest` (the
-//! generated manifest JSON Schema).
+//! generated manifest JSON Schema). Collection reads are
+//! content-negotiated: `Accept: text/cddal` serves the canonical
+//! plain-text dictionary form (see `cddal`); JSON is the default
+//! and the fallback, with a warning header when the `Accept` listed
+//! nothing servable.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -23,13 +27,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Extension, Router};
 use serde_json::{json, Map, Value};
 use tokio::net::TcpListener;
 
+use crate::cddal::{self, Representation};
 use crate::clock;
 use crate::discovery::{
     key_id as operator_key_id, operator_id as operator_id_of, operator_public_key, operator_record,
@@ -480,6 +485,11 @@ async fn discovery() -> Result<Response, Response> {
             "query_parameter": "at (alias: asof)",
             "response_header": "x-as-of"
         },
+        "content_negotiation": {
+            "default": "application/json",
+            "text/cddal": "collection reads (GET /items and the subregister listings) serve the canonical CDDAL plain-text dictionary form when Accept lists text/cddal — see README 'CDDAL serialization'",
+            "unknown_accept": "an Accept header listing nothing servable falls back to JSON with the x-content-negotiation: unknown-accept-fallback warning header"
+        },
         "discovery": {
             "service_descriptor_signature": "Ed25519 over canonical-JSON of body (signature block excluded); operator id is content-derived from the public key",
             "operator_keyring": "seeded dev keyring: unidpp-{registry,issuer,resolver,trust,log,archive,cli-verifier,edge}; loaded at startup; signatures are verified at intake only (replay re-applies the stored record)"
@@ -597,9 +607,14 @@ async fn create_item(
 }
 
 /// GET /items — list items (optionally class-/register-scoped), each
-/// with the version in force at `at`.
+/// with the version in force at `at`. Content-negotiated (T-06):
+/// `Accept: text/cddal` serves the canonical plain-text dictionary
+/// form; an Accept nothing in which this service can serve falls
+/// back to JSON with the `x-content-negotiation:
+/// unknown-accept-fallback` warning header.
 async fn list_items(
     State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
     scope: Option<ItemClass>,
 ) -> Result<Response, Response> {
@@ -618,6 +633,31 @@ async fn list_items(
         },
     };
     let register = opt_query(&params, "register");
+    let (repr, unknown_fallback) =
+        cddal::negotiate(headers.get("accept").and_then(|v| v.to_str().ok()));
+    if repr == Representation::Cddal {
+        // The canonical form carries no serving metadata (the as-of
+        // stamp rides in the header only) — two reads of the same
+        // state are byte-identical.
+        let body = {
+            let store = app.store.lock().expect("store poisoned");
+            cddal::render(
+                &store
+                    .items_filtered(class, register.as_deref())
+                    .iter()
+                    .map(|item| cddal::TermEntry::of(item, at))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        return Ok(build_response(
+            StatusCode::OK,
+            vec![
+                ("content-type".into(), cddal::MEDIA_TYPE.into()),
+                ("x-as-of".into(), as_of.to_string()),
+            ],
+            body,
+        ));
+    }
     let items = {
         let store = app.store.lock().expect("store poisoned");
         store
@@ -626,11 +666,18 @@ async fn list_items(
             .map(|item| item_summary(item, at))
             .collect::<Vec<_>>()
     };
-    Ok(stamped(
+    let mut response = stamped(
         StatusCode::OK,
         &json!({"as_of": as_of.to_string(), "count": items.len(), "items": items}),
         as_of,
-    ))
+    );
+    if unknown_fallback {
+        response.headers_mut().insert(
+            cddal::FALLBACK_HEADER,
+            HeaderValue::from_static(cddal::FALLBACK_VALUE),
+        );
+    }
+    Ok(response)
 }
 
 /// GET /items/{id} — the item with the version in force at `at`
@@ -2225,9 +2272,10 @@ async fn create_items(
 
 async fn list_all_items(
     state: State<Arc<AppState>>,
+    headers: HeaderMap,
     query: Query<HashMap<String, String>>,
 ) -> Result<Response, Response> {
-    list_items(state, query, None).await
+    list_items(state, headers, query, None).await
 }
 
 async fn get_one_item(
@@ -2269,9 +2317,10 @@ async fn mappings_create(
 
 /// GET /cross-register-mappings — with `item`/`source`/`target`
 /// filters, the directional lookup; without them, the generic
-/// class-scoped listing.
+/// class-scoped listing (content-negotiated like every listing).
 async fn mappings_get_or_list(
     state: State<Arc<AppState>>,
+    headers: HeaderMap,
     query: Query<HashMap<String, String>>,
 ) -> Result<Response, Response> {
     let directional = ["item", "source", "target"]
@@ -2280,7 +2329,7 @@ async fn mappings_get_or_list(
     if directional {
         list_cross_register_mappings(state, query).await
     } else {
-        list_items(state, query, Some(ItemClass::CrossRegisterMapping)).await
+        list_items(state, headers, query, Some(ItemClass::CrossRegisterMapping)).await
     }
 }
 
@@ -2332,9 +2381,10 @@ async fn sub_create(
 async fn sub_list(
     state: State<Arc<AppState>>,
     Extension(class): Extension<ItemClass>,
+    headers: HeaderMap,
     query: Query<HashMap<String, String>>,
 ) -> Result<Response, Response> {
-    list_items(state, query, Some(class)).await
+    list_items(state, headers, query, Some(class)).await
 }
 
 async fn sub_get(
