@@ -1,7 +1,7 @@
 //! UniDPP discovery registry: signed service descriptors (C3),
 //! protocol bindings (C4) and verification mechanisms (C5).
 //!
-//! Per PLAN-OPERATORS §1 (the global registry of DPP services and
+//! Per operator-model §1 (the global registry of DPP services and
 //! semantics), the discovery layer registers the *shape* of every
 //! service, the *grammar* of every protocol to reach it, and the
 //! *mechanism* to verify it — as discoverable, versioned, signed items
@@ -43,7 +43,7 @@ use crate::time::Timestamp;
 // Service class (C3) — the operational role a descriptor advertises
 // ---------------------------------------------------------------------------
 
-/// The operational role a `ServiceDescriptor` advertises (PLAN-OPERATORS
+/// The operational role a `ServiceDescriptor` advertises (the UniDPP operator model
 /// §1.1 row C3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ServiceClass {
@@ -162,7 +162,7 @@ impl fmt::Display for ServiceStatus {
 
 /// An operator identity. The `id` is content-derived
 /// (`op-` + 16 hex chars of `H(suite-code || public-key)`) so that an
-/// operator id pins exactly one public key (PLAN-OPERATORS §1.4 — the
+/// operator id pins exactly one public key (operator-model §1.4 — the
 /// "no service is mandatory" rule is mechanical, not asserted).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperatorId {
@@ -862,7 +862,7 @@ pub fn parse_service_body(body: &Value, identifier: &str) -> Result<ServiceBody,
 // C4 — Protocol binding
 // ---------------------------------------------------------------------------
 
-/// One protocol binding (PLAN-OPERATORS §1.1 row C4). The grammar
+/// One protocol binding (operator-model §1.1 row C4). The grammar
 /// reference is the normative pointer; media types are advisory
 /// strings (`application/vnd.unidpp.tier-a+json`, etc.).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1010,7 +1010,7 @@ pub fn parse_protocol_body(body: &Value) -> Result<ProtocolBody, DiscoveryError>
 // C5 — Verification mechanism
 // ---------------------------------------------------------------------------
 
-/// One verification mechanism (PLAN-OPERATORS §1.1 row C5). The
+/// One verification mechanism (operator-model §1.1 row C5). The
 /// `suite` is the canonical name registered in the SIGNATIF model;
 /// the `trust_list_endpoint` and `master_list_ref` are the trust-graph
 /// wires a client needs to verify verdicts.

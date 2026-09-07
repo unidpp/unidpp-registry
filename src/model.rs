@@ -222,9 +222,7 @@ impl ItemVersion {
         let ts = |k: &str| -> Result<Option<Timestamp>, String> {
             match obj.get(k) {
                 None | Some(Value::Null) => Ok(None),
-                Some(Value::String(s)) => {
-                    Timestamp::parse(s).map(Some).map_err(|e| e.to_string())
-                }
+                Some(Value::String(s)) => Timestamp::parse(s).map(Some).map_err(|e| e.to_string()),
                 Some(_) => Err(format!("`{k}` must be an RFC 3339 string")),
             }
         };
@@ -327,15 +325,19 @@ impl Item {
     /// broken/cyclic links.
     pub fn supersession_chain(&self, from: Option<&str>) -> Result<Vec<&ItemVersion>, String> {
         let start = match from {
-            Some(n) => self.version(n).ok_or_else(|| {
-                format!("item `{}` has no version `{}`", self.identifier, n)
-            })?,
-            None => *self.ordered_versions().first().ok_or_else(|| {
-                format!("item `{}` has no versions", self.identifier)
-            })?,
+            Some(n) => self
+                .version(n)
+                .ok_or_else(|| format!("item `{}` has no version `{}`", self.identifier, n))?,
+            None => *self
+                .ordered_versions()
+                .first()
+                .ok_or_else(|| format!("item `{}` has no versions", self.identifier))?,
         };
         let mut chain = vec![start];
-        while let Some(next) = chain.last().and_then(|v| v.superseded_by_version.as_deref()) {
+        while let Some(next) = chain
+            .last()
+            .and_then(|v| v.superseded_by_version.as_deref())
+        {
             let nv = self.version(next).ok_or_else(|| {
                 format!(
                     "item `{}` has no version `{next}` (broken supersession link)",
@@ -527,9 +529,7 @@ impl ApplicabilityBinding {
         let ts = |k: &str| -> Result<Option<Timestamp>, String> {
             match obj.get(k) {
                 None | Some(Value::Null) => Ok(None),
-                Some(Value::String(s)) => {
-                    Timestamp::parse(s).map(Some).map_err(|e| e.to_string())
-                }
+                Some(Value::String(s)) => Timestamp::parse(s).map(Some).map_err(|e| e.to_string()),
                 Some(_) => Err(format!("`{k}` must be an RFC 3339 string")),
             }
         };
@@ -542,7 +542,10 @@ impl ApplicabilityBinding {
             effective_from: ts("effective_from")?,
             effective_until: ts("effective_until")?,
             registered_at: ts("registered_at")?,
-            retroactive: obj.get("retroactive").and_then(Value::as_bool).unwrap_or(false),
+            retroactive: obj
+                .get("retroactive")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         })
     }
 }
@@ -570,7 +573,11 @@ mod tests {
     /// The Ruby spec fixture shape: eu-espr-textiles with a superseded
     /// 0.9.0 (explicit window) and a valid 1.0.0.
     fn eu_espr() -> Item {
-        let mut v09 = version("0.9.0", "2026-10-18T00:00:00Z", Some("2027-10-18T00:00:00Z"));
+        let mut v09 = version(
+            "0.9.0",
+            "2026-10-18T00:00:00Z",
+            Some("2027-10-18T00:00:00Z"),
+        );
         v09.status = Status::Superseded;
         v09.superseded_by_version = Some("1.0.0".into());
         v09.notes = Some("first delegated-act edition".into());
@@ -590,7 +597,10 @@ mod tests {
     #[test]
     fn item_class_parses_singular_and_plural() {
         assert_eq!(ItemClass::parse("profile"), Some(ItemClass::Profile));
-        assert_eq!(ItemClass::parse("crypto-suites"), Some(ItemClass::CryptoSuite));
+        assert_eq!(
+            ItemClass::parse("crypto-suites"),
+            Some(ItemClass::CryptoSuite)
+        );
         assert_eq!(ItemClass::parse(" unit "), Some(ItemClass::Unit));
         assert_eq!(ItemClass::parse("bogus"), None);
         assert_eq!(ItemClass::Profile.plural(), "profiles");
@@ -602,10 +612,7 @@ mod tests {
         let item = eu_espr();
         let v09 = item.version("0.9.0").unwrap();
         // explicit effective_until wins over the successor's from
-        assert_eq!(
-            item.window_until(v09),
-            Some(ts("2027-10-18T00:00:00Z"))
-        );
+        assert_eq!(item.window_until(v09), Some(ts("2027-10-18T00:00:00Z")));
     }
 
     #[test]
@@ -635,16 +642,22 @@ mod tests {
         let item = eu_espr();
         assert_eq!(item.in_force_at(ts("2020-01-01T00:00:00Z")), None);
         assert_eq!(
-            item.in_force_at(ts("2027-06-01T00:00:00Z")).unwrap().version,
+            item.in_force_at(ts("2027-06-01T00:00:00Z"))
+                .unwrap()
+                .version,
             "0.9.0"
         );
         assert_eq!(
-            item.in_force_at(ts("2028-01-01T00:00:00Z")).unwrap().version,
+            item.in_force_at(ts("2028-01-01T00:00:00Z"))
+                .unwrap()
+                .version,
             "1.0.0"
         );
         // half-open window: at the boundary instant the successor rules
         assert_eq!(
-            item.in_force_at(ts("2027-10-18T00:00:00Z")).unwrap().version,
+            item.in_force_at(ts("2027-10-18T00:00:00Z"))
+                .unwrap()
+                .version,
             "1.0.0"
         );
     }
@@ -685,7 +698,10 @@ mod tests {
         item.manifest = Some(json!({"version": "99.0.0"}));
         assert!(!item.manifest_version_pinned());
         item.manifest = Some(json!({"profile_id": "x"}));
-        assert!(!item.manifest_version_pinned(), "no version key is unpinned");
+        assert!(
+            !item.manifest_version_pinned(),
+            "no version key is unpinned"
+        );
     }
 
     #[test]

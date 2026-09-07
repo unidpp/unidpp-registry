@@ -1,6 +1,6 @@
 //! UniDPP ISO 19135 registry service (crate `unidpp-registry`).
 //!
-//! Part of UniDPP (github.com/unidpp) — implements TODO.impl
+//! Part of UniDPP (github.com/unidpp) — part of UniDPP
 //! `10-remaining-tasks-definitive.md` item 12: a running registry
 //! (19135 item service) that the issuer and resolver both consume.
 //! The model mirrors the Ruby reference `unidpp-rb/lib/unidpp/registry`

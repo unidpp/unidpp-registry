@@ -151,9 +151,10 @@ pub async fn request(
             }
         }
         let mut body_bytes = raw[header_end..].to_vec();
-        let chunked = resp_headers
-            .iter()
-            .any(|(k, v)| k.eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked"));
+        let chunked = resp_headers.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case("transfer-encoding")
+                && v.to_ascii_lowercase().contains("chunked")
+        });
         let content_length = resp_headers
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
@@ -205,9 +206,7 @@ pub async fn request(
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Decode a complete chunked body; errors while more data is still
@@ -219,8 +218,8 @@ fn decode_chunked_body(raw: &[u8]) -> Result<Vec<u8>, String> {
         let line_end = find_subslice(&raw[pos..], b"\r\n")
             .ok_or_else(|| "incomplete chunk header".to_string())?
             + pos;
-        let size_str = std::str::from_utf8(&raw[pos..line_end])
-            .map_err(|_| "bad chunk header".to_string())?;
+        let size_str =
+            std::str::from_utf8(&raw[pos..line_end]).map_err(|_| "bad chunk header".to_string())?;
         let size_hex = size_str.split(';').next().unwrap_or("").trim();
         let size = usize::from_str_radix(size_hex, 16)
             .map_err(|_| format!("bad chunk size `{size_hex}`"))?;

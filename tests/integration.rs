@@ -16,11 +16,19 @@ use unidpp_registry::{Config, TestServer, Timestamp};
 const REGISTER: &str = "unidpp-dev";
 
 async fn spawn_open() -> TestServer {
-    TestServer::spawn(Config::default()).await.expect("spawn server")
+    TestServer::spawn(Config::default())
+        .await
+        .expect("spawn server")
 }
 
 async fn post(base: &str, path: &str, body: &Value, token: Option<&str>) -> support::HttpResponse {
-    support::json_request("POST", &format!("{base}{path}"), Some(&body.to_string()), token).await
+    support::json_request(
+        "POST",
+        &format!("{base}{path}"),
+        Some(&body.to_string()),
+        token,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -37,8 +45,14 @@ async fn register_item_current_version_and_discovery() {
     assert_eq!(resp.status, 200);
     let doc = json_of(&resp);
     assert_eq!(doc["service"], "unidpp-registry");
-    assert_eq!(doc["subregisters"]["crypto-suites"]["class"], "crypto-suite");
-    assert_eq!(doc["subregisters"]["trust-anchors"]["path"], "/trust-anchors");
+    assert_eq!(
+        doc["subregisters"]["crypto-suites"]["class"],
+        "crypto-suite"
+    );
+    assert_eq!(
+        doc["subregisters"]["trust-anchors"]["path"],
+        "/trust-anchors"
+    );
     assert_eq!(doc["as_of"]["response_header"], "x-as-of");
     assert_eq!(get(&format!("{base}/healthz")).await.status, 200);
 
@@ -110,7 +124,9 @@ async fn register_item_current_version_and_discovery() {
     // Unknown item and malformed `at`.
     assert_eq!(get(&format!("{base}/items/nope")).await.status, 404);
     assert_eq!(
-        get(&format!("{base}/items/unit-kwh?at=Yesterday")).await.status,
+        get(&format!("{base}/items/unit-kwh?at=Yesterday"))
+            .await
+            .status,
         400
     );
 
@@ -151,8 +167,14 @@ async fn supersede_and_point_in_time_windows() {
     assert_eq!(result["new_version"]["notes"], "consolidated edition");
     assert_eq!(result["superseded_version"]["version"], "0.9.0");
     assert_eq!(result["superseded_version"]["status"], "superseded");
-    assert_eq!(result["superseded_version"]["superseded_by_version"], "1.0.0");
-    assert_eq!(result["superseded_version"]["window_end"], "2027-10-18T00:00:00Z");
+    assert_eq!(
+        result["superseded_version"]["superseded_by_version"],
+        "1.0.0"
+    );
+    assert_eq!(
+        result["superseded_version"]["window_end"],
+        "2027-10-18T00:00:00Z"
+    );
     assert_eq!(result["audit_seq"], 2);
 
     let at = |when: &str| format!("{base}/items/eu-espr-textiles?at={}", enc(when));
@@ -190,34 +212,47 @@ async fn supersede_and_point_in_time_windows() {
     // Error cases.
     let dupe = json!({"version": "1.0.0", "reason": "again"});
     assert_eq!(
-        post(base, "/items/eu-espr-textiles/versions", &dupe, None).await.status,
+        post(base, "/items/eu-espr-textiles/versions", &dupe, None)
+            .await
+            .status,
         409
     );
     let no_reason = json!({"version": "2.0.0"});
     assert_eq!(
-        post(base, "/items/eu-espr-textiles/versions", &no_reason, None).await.status,
+        post(base, "/items/eu-espr-textiles/versions", &no_reason, None)
+            .await
+            .status,
         400
     );
     let bad_target = json!({"version": "2.0.0", "reason": "x", "supersede_version": "9.9.9"});
     assert_eq!(
-        post(base, "/items/eu-espr-textiles/versions", &bad_target, None).await.status,
+        post(base, "/items/eu-espr-textiles/versions", &bad_target, None)
+            .await
+            .status,
         400
     );
     // only the valid version can be superseded
     let old_target = json!({"version": "2.0.0", "reason": "x", "supersede_version": "0.9.0"});
     assert_eq!(
-        post(base, "/items/eu-espr-textiles/versions", &old_target, None).await.status,
+        post(base, "/items/eu-espr-textiles/versions", &old_target, None)
+            .await
+            .status,
         400
     );
     // the new window cannot start before the superseded version's
-    let backdated = json!({"version": "2.0.0", "reason": "x", "effective_from": "2026-01-01T00:00:00Z"});
+    let backdated =
+        json!({"version": "2.0.0", "reason": "x", "effective_from": "2026-01-01T00:00:00Z"});
     assert_eq!(
-        post(base, "/items/eu-espr-textiles/versions", &backdated, None).await.status,
+        post(base, "/items/eu-espr-textiles/versions", &backdated, None)
+            .await
+            .status,
         400
     );
     // unknown item
     assert_eq!(
-        post(base, "/items/nope/versions", &supersede, None).await.status,
+        post(base, "/items/nope/versions", &supersede, None)
+            .await
+            .status,
         404
     );
 
@@ -277,17 +312,27 @@ async fn supersession_chain() {
     assert!(chain["chain"][2].get("window_end").is_none());
 
     // From any version.
-    let resp = get(&format!("{base}/items/historic-vehicle/supersession?from=2.0.0")).await;
+    let resp = get(&format!(
+        "{base}/items/historic-vehicle/supersession?from=2.0.0"
+    ))
+    .await;
     let from_middle = json_of(&resp);
     assert_eq!(from_middle["chain"].as_array().unwrap().len(), 2);
     assert_eq!(from_middle["terminal"]["version"], "3.0.0");
 
     // Unknown start version and unknown item.
     assert_eq!(
-        get(&format!("{base}/items/historic-vehicle/supersession?from=9.9.9")).await.status,
+        get(&format!(
+            "{base}/items/historic-vehicle/supersession?from=9.9.9"
+        ))
+        .await
+        .status,
         400
     );
-    assert_eq!(get(&format!("{base}/items/nope/supersession")).await.status, 404);
+    assert_eq!(
+        get(&format!("{base}/items/nope/supersession")).await.status,
+        404
+    );
 
     server.stop().await;
 }
@@ -301,7 +346,10 @@ async fn applicability_retroactivity_and_windows() {
     let server = spawn_open().await;
     let base = &server.base_url;
 
-    for (id, from) in [("eu-espr-textiles", "2020-01-01T00:00:00Z"), ("conflict-minerals", "2020-01-01T00:00:00Z")] {
+    for (id, from) in [
+        ("eu-espr-textiles", "2020-01-01T00:00:00Z"),
+        ("conflict-minerals", "2020-01-01T00:00:00Z"),
+    ] {
         let resp = post(
             base,
             "/items",
@@ -353,7 +401,10 @@ async fn applicability_retroactivity_and_windows() {
         "effective_from": "2021-01-01T00:00:00Z",
         "retroactive": false
     });
-    assert_eq!(post(base, "/applicability", &forward, None).await.status, 201);
+    assert_eq!(
+        post(base, "/applicability", &forward, None).await.status,
+        201
+    );
 
     // Bounded window (retroactive, closed by effective_until).
     let bounded = json!({
@@ -363,7 +414,10 @@ async fn applicability_retroactivity_and_windows() {
         "effective_until": "2023-01-01T00:00:00Z",
         "retroactive": true
     });
-    assert_eq!(post(base, "/applicability", &bounded, None).await.status, 201);
+    assert_eq!(
+        post(base, "/applicability", &bounded, None).await.status,
+        201
+    );
 
     // 2022: the retroactive open binding and the bounded one; the
     // non-retroactive one is gated by registered_at (now, 2026).
@@ -440,7 +494,10 @@ async fn admin_auth_and_mutation_audit() {
 
     // Mutations are guarded.
     assert_eq!(post(base, "/items", &register, None).await.status, 401);
-    assert_eq!(post(base, "/items", &register, Some("wrong")).await.status, 401);
+    assert_eq!(
+        post(base, "/items", &register, Some("wrong")).await.status,
+        401
+    );
     let resp = post(base, "/items", &register, Some("s3cret")).await;
     assert_eq!(resp.status, 201);
     assert_eq!(json_of(&resp)["audit_seq"], 1);
@@ -473,13 +530,22 @@ async fn admin_auth_and_mutation_audit() {
     assert_eq!(get(&format!("{base}/admin/log")).await.status, 401);
     let resp = get(&format!("{base}/admin/log?limit=100")).await;
     assert_eq!(resp.status, 401);
-    let resp = json_request("GET", &format!("{base}/admin/log?limit=100"), None, Some("s3cret")).await;
+    let resp = json_request(
+        "GET",
+        &format!("{base}/admin/log?limit=100"),
+        None,
+        Some("s3cret"),
+    )
+    .await;
     assert_eq!(resp.status, 200);
     let log = json_of(&resp);
     assert_eq!(log["total"], 3);
     let records = log["records"].as_array().unwrap();
     let ops: Vec<&str> = records.iter().map(|r| r["op"].as_str().unwrap()).collect();
-    assert_eq!(ops, vec!["register-item", "supersede-version", "bind-applicability"]);
+    assert_eq!(
+        ops,
+        vec!["register-item", "supersede-version", "bind-applicability"]
+    );
     let seqs: Vec<u64> = records.iter().map(|r| r["seq"].as_u64().unwrap()).collect();
     assert_eq!(seqs, vec![1, 2, 3]);
     for r in records {
@@ -589,7 +655,10 @@ async fn subregisters_are_class_scoped() {
 
     // Class scoping hides items of other classes.
     assert_eq!(get(&format!("{base}/units/ed25519")).await.status, 404);
-    assert_eq!(get(&format!("{base}/crypto-suites/ta-nist")).await.status, 404);
+    assert_eq!(
+        get(&format!("{base}/crypto-suites/ta-nist")).await.status,
+        404
+    );
 
     // The flat endpoints see everything.
     let resp = get(&format!("{base}/items?class=trust-anchor")).await;
@@ -618,31 +687,52 @@ async fn journal_replays_state_across_restart() {
         let server = TestServer::spawn(config.clone()).await.expect("spawn A");
         let base = &server.base_url;
         assert_eq!(
-            post(base, "/items", &json!({
-                "register_id": REGISTER,
-                "item_id": "eu-espr-textiles",
-                "class": "profile",
-                "definition": "EU ESPR textiles profile",
-                "version": "0.9.0",
-                "effective_from": "2026-10-18T00:00:00Z"
-            }), None).await.status,
+            post(
+                base,
+                "/items",
+                &json!({
+                    "register_id": REGISTER,
+                    "item_id": "eu-espr-textiles",
+                    "class": "profile",
+                    "definition": "EU ESPR textiles profile",
+                    "version": "0.9.0",
+                    "effective_from": "2026-10-18T00:00:00Z"
+                }),
+                None
+            )
+            .await
+            .status,
             201
         );
         assert_eq!(
-            post(base, "/items/eu-espr-textiles/versions", &json!({
-                "version": "1.0.0",
-                "reason": "consolidated edition",
-                "effective_from": "2027-10-18T00:00:00Z"
-            }), None).await.status,
+            post(
+                base,
+                "/items/eu-espr-textiles/versions",
+                &json!({
+                    "version": "1.0.0",
+                    "reason": "consolidated edition",
+                    "effective_from": "2027-10-18T00:00:00Z"
+                }),
+                None
+            )
+            .await
+            .status,
             201
         );
         assert_eq!(
-            post(base, "/applicability", &json!({
-                "profile_id": "eu-espr-textiles",
-                "product_type": SUBJECT,
-                "effective_from": "1996-01-01T00:00:00Z",
-                "retroactive": true
-            }), None).await.status,
+            post(
+                base,
+                "/applicability",
+                &json!({
+                    "profile_id": "eu-espr-textiles",
+                    "product_type": SUBJECT,
+                    "effective_from": "1996-01-01T00:00:00Z",
+                    "retroactive": true
+                }),
+                None
+            )
+            .await
+            .status,
             201
         );
         server.stop().await;
@@ -651,7 +741,10 @@ async fn journal_replays_state_across_restart() {
     // A fresh server on the same journal replays the audit log.
     let server = TestServer::spawn(config).await.expect("spawn B");
     let base = &server.base_url;
-    let resp = get(&format!("{base}/items/eu-espr-textiles?at=2028-01-01T00:00:00Z")).await;
+    let resp = get(&format!(
+        "{base}/items/eu-espr-textiles?at=2028-01-01T00:00:00Z"
+    ))
+    .await;
     assert_eq!(resp.status, 200);
     let item = json_of(&resp);
     assert_eq!(item["version"]["version"], "1.0.0");
