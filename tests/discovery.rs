@@ -14,11 +14,19 @@ use support::{enc, get, json_of};
 use unidpp_registry::{operator_public_key, operator_record, sign_body, Config, TestServer};
 
 async fn spawn_open() -> TestServer {
-    TestServer::spawn(Config::default()).await.expect("spawn server")
+    TestServer::spawn(Config::default())
+        .await
+        .expect("spawn server")
 }
 
 async fn post(base: &str, path: &str, body: &Value, token: Option<&str>) -> support::HttpResponse {
-    support::json_request("POST", &format!("{base}{path}"), Some(&body.to_string()), token).await
+    support::json_request(
+        "POST",
+        &format!("{base}{path}"),
+        Some(&body.to_string()),
+        token,
+    )
+    .await
 }
 
 /// Sign a service-descriptor body with the given operator label and
@@ -116,7 +124,12 @@ async fn services_signed_registration_and_filters() {
         "2026-02-01T00:00:00Z",
     );
     let resp = post(base, "/services", &de_issuer, None).await;
-    assert_eq!(resp.status, 201, "valid signature accepted: {}", resp.body_string());
+    assert_eq!(
+        resp.status,
+        201,
+        "valid signature accepted: {}",
+        resp.body_string()
+    );
     let created = json_of(&resp);
     assert_eq!(created["identifier"], "issuer-de-1");
     assert_eq!(created["version"]["version"], "1.0.0");
@@ -163,16 +176,27 @@ async fn services_signed_registration_and_filters() {
     assert_eq!(json_of(&resp)["count"], 0);
 
     // Unknown class filter value is a 400.
-    assert_eq!(get(&format!("{base}/services?class=nope")).await.status, 400);
+    assert_eq!(
+        get(&format!("{base}/services?class=nope")).await.status,
+        400
+    );
 
     // Single service lookup with as-of semantics: before its window the
     // resolved version is null; the x-as-of header carries the instant.
-    let resp = get(&format!("{base}/services/issuer-de-1?at={}", enc("2025-06-01T00:00:00Z"))).await;
+    let resp = get(&format!(
+        "{base}/services/issuer-de-1?at={}",
+        enc("2025-06-01T00:00:00Z")
+    ))
+    .await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.header("x-as-of").unwrap(), "2025-06-01T00:00:00Z");
     assert_eq!(json_of(&resp)["version"], Value::Null);
 
-    let resp = get(&format!("{base}/services/issuer-de-1?at={}", enc("2026-06-01T00:00:00Z"))).await;
+    let resp = get(&format!(
+        "{base}/services/issuer-de-1?at={}",
+        enc("2026-06-01T00:00:00Z")
+    ))
+    .await;
     assert_eq!(json_of(&resp)["version"]["version"], "1.0.0");
 
     // Current view without `at`.
@@ -181,7 +205,10 @@ async fn services_signed_registration_and_filters() {
     assert_eq!(svc["version"]["version"], "1.0.0");
     assert_eq!(svc["version"]["body"]["class"], "issuer");
     assert_eq!(svc["version"]["body"]["jurisdiction"], "DE");
-    assert_eq!(svc["version"]["body"]["endpoints"][0]["uri"], "https://issuer-de.unidpp.org/");
+    assert_eq!(
+        svc["version"]["body"]["endpoints"][0]["uri"],
+        "https://issuer-de.unidpp.org/"
+    );
 
     // Duplicate registration conflicts.
     let resp = post(base, "/services", &de_issuer, None).await;
@@ -258,9 +285,18 @@ async fn services_supersession_and_as_of() {
     // As-of: 2026 → v1 in force (status superseded, window derived);
     // 2027+ → v2.
     let at = |when: &str| format!("{base}/services/trust-unidpp-1?at={}", enc(when));
-    assert_eq!(json_of(&get(&at("2026-06-01T00:00:00Z")).await)["version"]["version"], "1.0.0");
-    assert_eq!(json_of(&get(&at("2027-06-01T00:00:00Z")).await)["version"]["version"], "2.0.0");
-    assert_eq!(json_of(&get(&format!("{base}/services/trust-unidpp-1")).await)["version"]["version"], "2.0.0");
+    assert_eq!(
+        json_of(&get(&at("2026-06-01T00:00:00Z")).await)["version"]["version"],
+        "1.0.0"
+    );
+    assert_eq!(
+        json_of(&get(&at("2027-06-01T00:00:00Z")).await)["version"]["version"],
+        "2.0.0"
+    );
+    assert_eq!(
+        json_of(&get(&format!("{base}/services/trust-unidpp-1")).await)["version"]["version"],
+        "2.0.0"
+    );
 
     // Supersession chain.
     let resp = get(&format!("{base}/services/trust-unidpp-1/supersession")).await;
@@ -288,11 +324,15 @@ async fn services_supersession_and_as_of() {
     .expect("sign dupe");
     dupe["signature"] = dupe["body"]["signature"].clone();
     assert_eq!(
-        post(base, "/services/trust-unidpp-1/versions", &dupe, None).await.status,
+        post(base, "/services/trust-unidpp-1/versions", &dupe, None)
+            .await
+            .status,
         409
     );
     assert_eq!(
-        post(base, "/services/nope/versions", &supersede, None).await.status,
+        post(base, "/services/nope/versions", &supersede, None)
+            .await
+            .status,
         404
     );
 
@@ -363,12 +403,21 @@ async fn protocol_bindings_and_verification_mechanisms() {
     let base = &server.base_url;
 
     // C4: register + list + get.
-    let resp = post(base, "/protocol-bindings", &signed_protocol_binding("pb-test-1", "https://example/grammar"), None).await;
+    let resp = post(
+        base,
+        "/protocol-bindings",
+        &signed_protocol_binding("pb-test-1", "https://example/grammar"),
+        None,
+    )
+    .await;
     assert_eq!(resp.status, 201, "{}", resp.body_string());
     let created = json_of(&resp);
     assert_eq!(created["identifier"], "pb-test-1");
     assert_eq!(created["binding"]["grammar_ref"], "https://example/grammar");
-    assert_eq!(created["binding"]["media_types"][0], "application/test+json");
+    assert_eq!(
+        created["binding"]["media_types"][0],
+        "application/test+json"
+    );
     assert_eq!(created["audit_seq"], 1);
 
     let resp = get(&format!("{base}/protocol-bindings")).await;
@@ -381,13 +430,29 @@ async fn protocol_bindings_and_verification_mechanisms() {
 
     // Duplicate conflicts; unknown 404.
     assert_eq!(
-        post(base, "/protocol-bindings", &signed_protocol_binding("pb-test-1", "https://example/grammar"), None).await.status,
+        post(
+            base,
+            "/protocol-bindings",
+            &signed_protocol_binding("pb-test-1", "https://example/grammar"),
+            None
+        )
+        .await
+        .status,
         409
     );
-    assert_eq!(get(&format!("{base}/protocol-bindings/nope")).await.status, 404);
+    assert_eq!(
+        get(&format!("{base}/protocol-bindings/nope")).await.status,
+        404
+    );
 
     // C5: register + list + get.
-    let resp = post(base, "/verification-mechanisms", &signed_verification_mechanism("vm-test-1", "SM2-SM3-SM4"), None).await;
+    let resp = post(
+        base,
+        "/verification-mechanisms",
+        &signed_verification_mechanism("vm-test-1", "SM2-SM3-SM4"),
+        None,
+    )
+    .await;
     assert_eq!(resp.status, 201, "{}", resp.body_string());
     let created = json_of(&resp);
     assert_eq!(created["identifier"], "vm-test-1");
@@ -401,18 +466,38 @@ async fn protocol_bindings_and_verification_mechanisms() {
     let resp = get(&format!("{base}/verification-mechanisms/vm-test-1")).await;
     assert_eq!(json_of(&resp)["suite"], "SM2-SM3-SM4");
     assert_eq!(
-        post(base, "/verification-mechanisms", &signed_verification_mechanism("vm-test-1", "SM2-SM3-SM4"), None).await.status,
+        post(
+            base,
+            "/verification-mechanisms",
+            &signed_verification_mechanism("vm-test-1", "SM2-SM3-SM4"),
+            None
+        )
+        .await
+        .status,
         409
     );
-    assert_eq!(get(&format!("{base}/verification-mechanisms/nope")).await.status, 404);
+    assert_eq!(
+        get(&format!("{base}/verification-mechanisms/nope"))
+            .await
+            .status,
+        404
+    );
 
     // Missing required fields.
     let mut bad = signed_protocol_binding("pb-bad-1", "https://example/g");
     bad["body"]["grammar_ref"] = Value::Null;
-    assert_eq!(post(base, "/protocol-bindings", &bad, None).await.status, 400);
+    assert_eq!(
+        post(base, "/protocol-bindings", &bad, None).await.status,
+        400
+    );
     let mut bad = signed_verification_mechanism("vm-bad-1", "x");
     bad["body"]["suite"] = Value::Null;
-    assert_eq!(post(base, "/verification-mechanisms", &bad, None).await.status, 400);
+    assert_eq!(
+        post(base, "/verification-mechanisms", &bad, None)
+            .await
+            .status,
+        400
+    );
 
     server.stop().await;
 }
@@ -461,9 +546,14 @@ async fn seed_dataset_populates_discovery_and_units() {
         "unidpp-cli-verifier-v1",
         "unidpp-edge-v1",
     ] {
-        assert!(svc_ids.contains(&expected), "seed service {expected} (got {svc_ids:?})");
+        assert!(
+            svc_ids.contains(&expected),
+            "seed service {expected} (got {svc_ids:?})"
+        );
     }
-    for class in ["registry", "issuer", "resolver", "trust", "log", "archive", "edge"] {
+    for class in [
+        "registry", "issuer", "resolver", "trust", "log", "archive", "edge",
+    ] {
         let resp = get(&format!("{base}/services?class={class}")).await;
         let filtered = json_of(&resp);
         assert!(
@@ -492,7 +582,10 @@ async fn seed_dataset_populates_discovery_and_units() {
         assert!(ids.contains(&expected), "seed protocol binding {expected}");
     }
     let en18222 = &list["protocol_bindings"][0];
-    assert_eq!(en18222["grammar_ref"], "https://standards.cen-cenelec.eu/EN-18222");
+    assert_eq!(
+        en18222["grammar_ref"],
+        "https://standards.cen-cenelec.eu/EN-18222"
+    );
     assert_eq!(en18222["media_types"][0], "application/vnd.en18222+json");
 
     // Verification mechanisms: SM2 / FIPS / ML-DSA.
@@ -527,8 +620,8 @@ async fn seed_dataset_populates_discovery_and_units() {
         .map(|u| u["identifier"].as_str().unwrap())
         .collect();
     for expected in [
-        "unit-m", "unit-kg", "unit-s", "unit-a", "unit-k", "unit-mol", "unit-cd",
-        "unit-kwh", "unit-mj", "unit-j",
+        "unit-m", "unit-kg", "unit-s", "unit-a", "unit-k", "unit-mol", "unit-cd", "unit-kwh",
+        "unit-mj", "unit-j",
     ] {
         assert!(ids.contains(&expected), "seed unit {expected}");
     }
@@ -578,11 +671,25 @@ async fn discovery_journal_replays_across_restart() {
         );
         assert_eq!(post(base, "/services", &svc, None).await.status, 201);
         assert_eq!(
-            post(base, "/protocol-bindings", &signed_protocol_binding("pb-jr-1", "https://example/g"), None).await.status,
+            post(
+                base,
+                "/protocol-bindings",
+                &signed_protocol_binding("pb-jr-1", "https://example/g"),
+                None
+            )
+            .await
+            .status,
             201
         );
         assert_eq!(
-            post(base, "/verification-mechanisms", &signed_verification_mechanism("vm-jr-1", "FIPS 186-4"), None).await.status,
+            post(
+                base,
+                "/verification-mechanisms",
+                &signed_verification_mechanism("vm-jr-1", "FIPS 186-4"),
+                None
+            )
+            .await
+            .status,
             201
         );
         server.stop().await;
@@ -597,8 +704,14 @@ async fn discovery_journal_replays_across_restart() {
     let svc = json_of(&resp);
     assert_eq!(svc["version"]["version"], "1.0.0");
     assert_eq!(svc["version"]["body"]["class"], "log");
-    assert_eq!(json_of(&get(&format!("{base}/protocol-bindings")).await)["count"], 1);
-    assert_eq!(json_of(&get(&format!("{base}/verification-mechanisms")).await)["count"], 1);
+    assert_eq!(
+        json_of(&get(&format!("{base}/protocol-bindings")).await)["count"],
+        1
+    );
+    assert_eq!(
+        json_of(&get(&format!("{base}/verification-mechanisms")).await)["count"],
+        1
+    );
     let log = json_of(&get(&format!("{base}/admin/log")).await);
     assert_eq!(log["total"], 3);
     let ops: Vec<&str> = log["records"]
@@ -607,7 +720,14 @@ async fn discovery_journal_replays_across_restart() {
         .iter()
         .map(|r| r["op"].as_str().unwrap())
         .collect();
-    assert_eq!(ops, vec!["register-service", "register-protocol-binding", "register-verification-mechanism"]);
+    assert_eq!(
+        ops,
+        vec![
+            "register-service",
+            "register-protocol-binding",
+            "register-verification-mechanism"
+        ]
+    );
     server.stop().await;
 
     let _ = std::fs::remove_file(&path);
@@ -638,22 +758,45 @@ async fn discovery_endpoints_require_admin_when_configured() {
     // Unauthenticated mutation is denied.
     assert_eq!(post(base, "/services", &svc, None).await.status, 401);
     assert_eq!(
-        post(base, "/protocol-bindings", &signed_protocol_binding("pb-auth-1", "https://g/"), None).await.status,
+        post(
+            base,
+            "/protocol-bindings",
+            &signed_protocol_binding("pb-auth-1", "https://g/"),
+            None
+        )
+        .await
+        .status,
         401
     );
     assert_eq!(
-        post(base, "/verification-mechanisms", &signed_verification_mechanism("vm-auth-1", "SM2-SM3-SM4"), None).await.status,
+        post(
+            base,
+            "/verification-mechanisms",
+            &signed_verification_mechanism("vm-auth-1", "SM2-SM3-SM4"),
+            None
+        )
+        .await
+        .status,
         401
     );
-    assert_eq!(post(base, "/admin/seed", &json!({}), None).await.status, 401);
+    assert_eq!(
+        post(base, "/admin/seed", &json!({}), None).await.status,
+        401
+    );
 
     // Authenticated works.
-    assert_eq!(post(base, "/services", &svc, Some("s3cret")).await.status, 201);
+    assert_eq!(
+        post(base, "/services", &svc, Some("s3cret")).await.status,
+        201
+    );
 
     // Reads stay public.
     assert_eq!(get(&format!("{base}/services")).await.status, 200);
     assert_eq!(get(&format!("{base}/protocol-bindings")).await.status, 200);
-    assert_eq!(get(&format!("{base}/verification-mechanisms")).await.status, 200);
+    assert_eq!(
+        get(&format!("{base}/verification-mechanisms")).await.status,
+        200
+    );
 
     server.stop().await;
 }

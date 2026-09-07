@@ -254,8 +254,9 @@ impl OperatorKeyring {
             .map_err(|e| DiscoveryError::BadKey(format!("`{operator_id}`: {e}")))?;
         let sig = EdSignature::from_slice(signature)
             .map_err(|e| DiscoveryError::BadSignature(format!("length: {e}")))?;
-        vk.verify(payload, &sig)
-            .map_err(|_| DiscoveryError::BadSignature(format!("signature does not verify for `{operator_id}`")))
+        vk.verify(payload, &sig).map_err(|_| {
+            DiscoveryError::BadSignature(format!("signature does not verify for `{operator_id}`"))
+        })
     }
 }
 
@@ -550,9 +551,7 @@ impl ServiceVersion {
 
     /// Verify this version's signature against the operator keyring.
     pub fn verify(&self, keyring: &OperatorKeyring) -> Result<(), DiscoveryError> {
-        let payload = self
-            .signed_payload()
-            .map_err(DiscoveryError::Invalid)?;
+        let payload = self.signed_payload().map_err(DiscoveryError::Invalid)?;
         keyring.verify(&self.body_operator_id(), &payload, &self.signature.value)
     }
 
@@ -569,11 +568,17 @@ impl ServiceVersion {
         let mut m = Map::new();
         m.insert("version".into(), json!(self.version));
         m.insert("status".into(), json!(self.status.as_str()));
-        m.insert("effective_from".into(), json!(self.effective_from.to_string()));
+        m.insert(
+            "effective_from".into(),
+            json!(self.effective_from.to_string()),
+        );
         if let Some(t) = self.effective_until {
             m.insert("effective_until".into(), json!(t.to_string()));
         }
-        m.insert("registered_at".into(), json!(self.registered_at.to_string()));
+        m.insert(
+            "registered_at".into(),
+            json!(self.registered_at.to_string()),
+        );
         if let Some(s) = &self.superseded_by_version {
             m.insert("superseded_by_version".into(), json!(s));
         }
@@ -677,19 +682,17 @@ impl ServiceDescriptor {
 
     /// The version in force at time `t`.
     pub fn in_force_at(&self, t: Timestamp) -> Option<&ServiceVersion> {
-        self.ordered_versions()
-            .into_iter()
-            .rfind(|v| {
-                if t < v.effective_from {
+        self.ordered_versions().into_iter().rfind(|v| {
+            if t < v.effective_from {
+                return false;
+            }
+            if let Some(u) = v.effective_until {
+                if t >= u {
                     return false;
                 }
-                if let Some(u) = v.effective_until {
-                    if t >= u {
-                        return false;
-                    }
-                }
-                true
-            })
+            }
+            true
+        })
     }
 
     /// Resolved window end: explicit `effective_until`, else the
@@ -706,15 +709,19 @@ impl ServiceDescriptor {
 
     pub fn supersession_chain(&self, from: Option<&str>) -> Result<Vec<&ServiceVersion>, String> {
         let start = match from {
-            Some(n) => self.version(n).ok_or_else(|| {
-                format!("service `{0}` has no version `{n}`", self.identifier)
-            })?,
-            None => *self.ordered_versions().first().ok_or_else(|| {
-                format!("service `{}` has no versions", self.identifier)
-            })?,
+            Some(n) => self
+                .version(n)
+                .ok_or_else(|| format!("service `{0}` has no version `{n}`", self.identifier))?,
+            None => *self
+                .ordered_versions()
+                .first()
+                .ok_or_else(|| format!("service `{}` has no versions", self.identifier))?,
         };
         let mut chain = vec![start];
-        while let Some(next) = chain.last().and_then(|v| v.superseded_by_version.as_deref()) {
+        while let Some(next) = chain
+            .last()
+            .and_then(|v| v.superseded_by_version.as_deref())
+        {
             let nv = self.version(next).ok_or_else(|| {
                 format!(
                     "service `{0}` has no version `{next}` (broken supersession link)",
@@ -735,15 +742,21 @@ impl ServiceDescriptor {
     pub fn to_json(&self, as_of: Timestamp, at: Option<Timestamp>) -> Value {
         let resolved = match at {
             Some(t) => self.in_force_at(t).map(|v| v.to_json(self.window_until(v))),
-            None => self.current_version().map(|v| v.to_json(self.window_until(v))),
+            None => self
+                .current_version()
+                .map(|v| v.to_json(self.window_until(v))),
         };
         let mut m = Map::new();
         m.insert("identifier".into(), json!(self.identifier));
         m.insert("kind".into(), json!("service"));
-        m.insert("versions".into(), json!(self.ordered_versions()
-            .into_iter()
-            .map(|v| v.to_json(self.window_until(v)))
-            .collect::<Vec<_>>()));
+        m.insert(
+            "versions".into(),
+            json!(self
+                .ordered_versions()
+                .into_iter()
+                .map(|v| v.to_json(self.window_until(v)))
+                .collect::<Vec<_>>()),
+        );
         m.insert("version".into(), resolved.unwrap_or(Value::Null));
         m.insert("as_of".into(), json!(as_of.to_string()));
         Value::Object(m)
@@ -751,7 +764,9 @@ impl ServiceDescriptor {
 
     /// Canonical wire → struct parse (journal replay).
     pub fn from_json_value(v: &Value) -> Result<ServiceDescriptor, String> {
-        let obj = v.as_object().ok_or("service descriptor must be an object")?;
+        let obj = v
+            .as_object()
+            .ok_or("service descriptor must be an object")?;
         let identifier = obj
             .get("identifier")
             .and_then(Value::as_str)
@@ -764,7 +779,10 @@ impl ServiceDescriptor {
                 .collect::<Result<Vec<_>, _>>()?,
             _ => return Err("missing `versions` array".into()),
         };
-        Ok(ServiceDescriptor { identifier, versions })
+        Ok(ServiceDescriptor {
+            identifier,
+            versions,
+        })
     }
 
     /// Canonical struct → wire (journal storage). Same shape as
@@ -802,17 +820,25 @@ pub struct ServiceBody {
 /// Parses the wire body of a service descriptor (the inner object that
 /// gets signed) and validates its structural shape.
 pub fn parse_service_body(body: &Value, identifier: &str) -> Result<ServiceBody, DiscoveryError> {
-    let obj = body.as_object().ok_or_else(|| DiscoveryError::Invalid("body must be an object".into()))?;
+    let obj = body
+        .as_object()
+        .ok_or_else(|| DiscoveryError::Invalid("body must be an object".into()))?;
     let class = obj
         .get("class")
         .and_then(Value::as_str)
         .ok_or_else(|| DiscoveryError::Invalid("body missing `class`".into()))
-        .and_then(|s| ServiceClass::parse(s).ok_or_else(|| DiscoveryError::Invalid(format!("unknown service class `{s}` (expected one of {})", ServiceClass::help()))))?;
+        .and_then(|s| {
+            ServiceClass::parse(s).ok_or_else(|| {
+                DiscoveryError::Invalid(format!(
+                    "unknown service class `{s}` (expected one of {})",
+                    ServiceClass::help()
+                ))
+            })
+        })?;
     let operator_val = obj
         .get("operator")
         .ok_or_else(|| DiscoveryError::Invalid("body missing `operator`".into()))?;
-    let operator = OperatorRef::from_json(operator_val)
-        .map_err(DiscoveryError::Invalid)?;
+    let operator = OperatorRef::from_json(operator_val).map_err(DiscoveryError::Invalid)?;
     let endpoints_val = obj
         .get("endpoints")
         .ok_or_else(|| DiscoveryError::Invalid("body missing `endpoints`".into()))?;
@@ -822,19 +848,23 @@ pub fn parse_service_body(body: &Value, identifier: &str) -> Result<ServiceBody,
             .map(Endpoint::from_json)
             .collect::<Result<Vec<_>, _>>()
             .map_err(DiscoveryError::Invalid)?,
-        _ => return Err(DiscoveryError::Invalid("`endpoints` must be an array".into())),
+        _ => {
+            return Err(DiscoveryError::Invalid(
+                "`endpoints` must be an array".into(),
+            ))
+        }
     };
     if endpoints.is_empty() {
-        return Err(DiscoveryError::Invalid("`endpoints` must not be empty".into()));
+        return Err(DiscoveryError::Invalid(
+            "`endpoints` must not be empty".into(),
+        ));
     }
-    let opt = |k: &str| -> Option<String> {
-        obj.get(k).and_then(Value::as_str).map(str::to_string)
-    };
+    let opt =
+        |k: &str| -> Option<String> { obj.get(k).and_then(Value::as_str).map(str::to_string) };
     let status = match obj.get("status") {
         None | Some(Value::Null) => ServiceStatus::Active,
-        Some(Value::String(s)) => ServiceStatus::parse(s).ok_or_else(|| {
-            DiscoveryError::Invalid(format!("unknown `status` value `{s}`"))
-        })?,
+        Some(Value::String(s)) => ServiceStatus::parse(s)
+            .ok_or_else(|| DiscoveryError::Invalid(format!("unknown `status` value `{s}`")))?,
         Some(_) => return Err(DiscoveryError::Invalid("`status` must be a string".into())),
     };
     let body_id = obj
@@ -975,7 +1005,9 @@ pub struct ProtocolBody {
 
 /// Parse the body of a protocol binding from the wire.
 pub fn parse_protocol_body(body: &Value) -> Result<ProtocolBody, DiscoveryError> {
-    let obj = body.as_object().ok_or_else(|| DiscoveryError::Invalid("body must be an object".into()))?;
+    let obj = body
+        .as_object()
+        .ok_or_else(|| DiscoveryError::Invalid("body must be an object".into()))?;
     let grammar_ref = obj
         .get("grammar_ref")
         .and_then(Value::as_str)
@@ -1070,7 +1102,9 @@ impl VerificationMechanism {
 
     /// Canonical wire → struct parse (journal replay).
     pub fn from_json_value(v: &Value) -> Result<VerificationMechanism, String> {
-        let obj = v.as_object().ok_or("verification mechanism must be an object")?;
+        let obj = v
+            .as_object()
+            .ok_or("verification mechanism must be an object")?;
         let identifier = obj
             .get("identifier")
             .and_then(Value::as_str)
@@ -1137,7 +1171,9 @@ pub struct VerificationBody {
 }
 
 pub fn parse_verification_body(body: &Value) -> Result<VerificationBody, DiscoveryError> {
-    let obj = body.as_object().ok_or_else(|| DiscoveryError::Invalid("body must be an object".into()))?;
+    let obj = body
+        .as_object()
+        .ok_or_else(|| DiscoveryError::Invalid("body must be an object".into()))?;
     let req = |k: &str| -> Result<String, DiscoveryError> {
         obj.get(k)
             .and_then(Value::as_str)
@@ -1145,9 +1181,8 @@ pub fn parse_verification_body(body: &Value) -> Result<VerificationBody, Discove
             .map(str::to_string)
             .ok_or_else(|| DiscoveryError::Invalid(format!("body missing `{k}`")))
     };
-    let opt = |k: &str| -> Option<String> {
-        obj.get(k).and_then(Value::as_str).map(str::to_string)
-    };
+    let opt =
+        |k: &str| -> Option<String> { obj.get(k).and_then(Value::as_str).map(str::to_string) };
     Ok(VerificationBody {
         suite: req("suite")?,
         agility_status: req("agility_status")?,
@@ -1258,7 +1293,10 @@ mod tests {
         let k2 = OperatorKeyring::seeded_dev();
         assert_eq!(k1.operator_ids(), k2.operator_ids());
         // the registry's operator id is in the seeded set
-        assert!(k1.operator_ids().iter().any(|id| id == &operator_id_for_label("unidpp-registry")));
+        assert!(k1
+            .operator_ids()
+            .iter()
+            .any(|id| id == &operator_id_for_label("unidpp-registry")));
     }
 
     fn operator_id_for_label(label: &str) -> String {
@@ -1348,13 +1386,7 @@ mod tests {
             "residency_class": "eu",
             "status": "active",
         });
-        sign_body(
-            &mut body,
-            label,
-            &operator_id(&pk),
-            &key_id(&pk),
-        )
-        .expect("sign");
+        sign_body(&mut body, label, &operator_id(&pk), &key_id(&pk)).expect("sign");
         let signature = SignatureValue::from_json(&body["signature"]).expect("sig");
         ServiceVersion {
             version: version.to_string(),
@@ -1395,10 +1427,7 @@ mod tests {
         assert_eq!(svc.current_version().unwrap().version, "2.0.0");
         // derived window end from the successor's effective_from
         let v1 = svc.version("1.0.0").unwrap();
-        assert_eq!(
-            svc.window_until(v1),
-            Some(ts("2027-01-01T00:00:00Z"))
-        );
+        assert_eq!(svc.window_until(v1), Some(ts("2027-01-01T00:00:00Z")));
         assert_eq!(svc.window_until(svc.version("2.0.0").unwrap()), None);
     }
 
@@ -1500,11 +1529,7 @@ mod tests {
 
     #[test]
     fn operator_helpers_agree_with_keyring() {
-        for label in [
-            "unidpp-registry",
-            "unidpp-issuer",
-            "unidpp-cli-verifier",
-        ] {
+        for label in ["unidpp-registry", "unidpp-issuer", "unidpp-cli-verifier"] {
             let pk = operator_public_key(label);
             let record = operator_record(label);
             let kr = OperatorKeyring::seeded_dev();

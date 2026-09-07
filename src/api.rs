@@ -27,10 +27,10 @@ use serde_json::{json, Map, Value};
 use tokio::net::TcpListener;
 
 use crate::discovery::{
-    key_id as operator_key_id, operator_id as operator_id_of, operator_public_key,
-    operator_record, parse_protocol_body, parse_service_body, parse_verification_body, sign_body,
-    OperatorKeyring, ProtocolBinding, ServiceClass, ServiceDescriptor, ServiceStatus,
-    ServiceVersion, SignatureValue, VerificationMechanism,
+    key_id as operator_key_id, operator_id as operator_id_of, operator_public_key, operator_record,
+    parse_protocol_body, parse_service_body, parse_verification_body, sign_body, OperatorKeyring,
+    ProtocolBinding, ServiceClass, ServiceDescriptor, ServiceStatus, ServiceVersion,
+    SignatureValue, VerificationMechanism,
 };
 use crate::model::{ApplicabilityBinding, Item, ItemClass, ItemVersion, Status};
 use crate::store::{Store, StoreError};
@@ -85,7 +85,10 @@ impl Config {
             }
         }
         if let Ok(s) = std::env::var("UNIDPP_REGISTRY_SEED_ON_DEMAND") {
-            c.seed_on_demand = !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off");
+            c.seed_on_demand = !matches!(
+                s.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            );
         }
         c
     }
@@ -862,7 +865,9 @@ async fn create_service(
     let effective_until = opt_ts(&v, "effective_until")?;
     if let Some(until) = effective_until {
         if until <= effective_from {
-            return Err(bad_request("`effective_until` must be after `effective_from`"));
+            return Err(bad_request(
+                "`effective_until` must be after `effective_from`",
+            ));
         }
     }
     let parsed = parse_service_body(&body_val, &identifier).map_err(discovery_error)?;
@@ -943,10 +948,7 @@ async fn list_services(
             .cloned()
             .collect()
     };
-    let items: Vec<Value> = services
-        .into_iter()
-        .map(|s| s.to_json(as_of, at))
-        .collect();
+    let items: Vec<Value> = services.into_iter().map(|s| s.to_json(as_of, at)).collect();
     Ok(stamped(
         StatusCode::OK,
         &json!({"as_of": as_of.to_string(), "count": items.len(), "services": items}),
@@ -1009,7 +1011,9 @@ async fn supersede_service(
     let effective_until = opt_ts(&v, "effective_until")?;
     if let Some(until) = effective_until {
         if until <= effective_from {
-            return Err(bad_request("`effective_until` must be after `effective_from`"));
+            return Err(bad_request(
+                "`effective_until` must be after `effective_from`",
+            ));
         }
     }
     let parsed = parse_service_body(&body_val, &identifier).map_err(discovery_error)?;
@@ -1200,9 +1204,7 @@ async fn create_protocol_binding(
 }
 
 /// `GET /protocol-bindings` — list all registered protocol bindings.
-async fn list_protocol_bindings(
-    State(app): State<Arc<AppState>>,
-) -> Result<Response, Response> {
+async fn list_protocol_bindings(State(app): State<Arc<AppState>>) -> Result<Response, Response> {
     let as_of = Timestamp::now();
     let bindings: Vec<ProtocolBinding> = {
         let store = app.store.lock().expect("store poisoned");
@@ -1414,7 +1416,11 @@ fn run_seed(app: &Arc<AppState>) -> Result<Value, String> {
         ("unit-k", "kelvin", "ISO 80000-5:2007"),
         ("unit-mol", "mole", "ISO 80000-9:2009"),
         ("unit-cd", "candela", "ISO 80000-7:2008"),
-        ("unit-kwh", "kilowatt hour", "ISO 80000-4:2006 (energy); 1 kWh = 3.6 MJ exactly"),
+        (
+            "unit-kwh",
+            "kilowatt hour",
+            "ISO 80000-4:2006 (energy); 1 kWh = 3.6 MJ exactly",
+        ),
         ("unit-mj", "megajoule", "ISO 80000-4:2006 (energy)"),
         ("unit-j", "joule", "ISO 80000-4:2006 (energy)"),
     ];
@@ -1469,9 +1475,8 @@ fn run_seed(app: &Arc<AppState>) -> Result<Value, String> {
         store
             .register_verification_mechanism(mech)
             .map_err(|e| format!("seed verification mechanism `{label}`: {e:?}"))?;
-        counts["verification_mechanisms"] = json!(
-            counts["verification_mechanisms"].as_u64().unwrap() + 1
-        );
+        counts["verification_mechanisms"] =
+            json!(counts["verification_mechanisms"].as_u64().unwrap() + 1);
     }
     drop(app.store.lock());
 
@@ -1520,7 +1525,9 @@ fn seed_protocol_bindings() -> Vec<(String, ProtocolBinding)> {
             description: "GS1 Digital Link URI grammar (v1.2)",
             grammar_ref: "https://www.gs1.org/standards/gs1-digital-link",
             media_types: vec!["application/gs1dl+json"],
-            conformance_suite_ref: Some("https://www.gs1.org/standards/gs1-digital-link/conformance"),
+            conformance_suite_ref: Some(
+                "https://www.gs1.org/standards/gs1-digital-link/conformance",
+            ),
         },
         SeedProtocol {
             id: "pb-gbt-33993",
@@ -1565,8 +1572,7 @@ fn seed_protocol_bindings() -> Vec<(String, ProtocolBinding)> {
             });
             sign_body(&mut wire, "unidpp-registry", &op_id_str, &key_id_str)
                 .expect("sign protocol binding");
-            let signature =
-                SignatureValue::from_json(&wire["signature"]).expect("signature parse");
+            let signature = SignatureValue::from_json(&wire["signature"]).expect("signature parse");
             let parsed = parse_protocol_body(&wire).expect("parse body");
             (
                 e.id.to_string(),
@@ -1634,8 +1640,7 @@ fn seed_verification_mechanisms() -> Vec<(String, VerificationMechanism)> {
             });
             sign_body(&mut wire, "unidpp-registry", &op_id_str, &key_id_str)
                 .expect("sign verification mechanism");
-            let signature =
-                SignatureValue::from_json(&wire["signature"]).expect("signature parse");
+            let signature = SignatureValue::from_json(&wire["signature"]).expect("signature parse");
             let parsed = parse_verification_body(&wire).expect("parse body");
             (
                 e.id.to_string(),
@@ -1691,8 +1696,7 @@ fn seed_services() -> Vec<(String, ServiceDescriptor)> {
                 "version": "1.0.0",
                 "effective_from": eff.to_string(),
             });
-            sign_body(&mut body, label, &op_id_str, &key_id_str)
-                .expect("sign service body");
+            sign_body(&mut body, label, &op_id_str, &key_id_str).expect("sign service body");
             let signature = SignatureValue::from_json(&body["signature"]).expect("sig parse");
             let version = ServiceVersion {
                 version: "1.0.0".to_string(),
