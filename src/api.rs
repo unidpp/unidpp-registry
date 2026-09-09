@@ -445,6 +445,8 @@ async fn discovery() -> Result<Response, Response> {
     }
     let doc = json!({
         "service": "unidpp-registry",
+        "version": env!("CARGO_PKG_VERSION"),
+        "build_id": option_env!("UNIDPP_BUILD_ID").unwrap_or("dev"),
         "description": "UniDPP ISO 19135 register service: item registration, version supersession, point-in-time resolution, applicability bindings, and the discovery registry (C3 services, C4 protocol bindings, C5 verification mechanisms)",
         "endpoints": {
             "register_item": "POST /items",
