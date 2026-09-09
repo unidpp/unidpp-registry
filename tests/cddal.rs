@@ -82,7 +82,13 @@ async fn seed_fixture(base: &str) {
                 "item_id": "eu-espr-textiles",
                 "definition": "EU ESPR textiles jurisdiction profile",
                 "version": "1.0.0",
-                "effective_from": "2026-10-18T00:00:00Z"
+                "effective_from": "2026-10-18T00:00:00Z",
+                "manifest": {
+                    "version": "1.0.0",
+                    "issuer_class": "law",
+                    "issuer": "ec-espr",
+                    "signature": {"signature": "ab01"}
+                }
             }),
         ),
         (

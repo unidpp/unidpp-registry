@@ -147,6 +147,7 @@ async fn supersede_and_point_in_time_windows() {
         "item_id": "eu-espr-textiles",
         "class": "profile",
         "definition": "EU ESPR textiles jurisdiction profile",
+        "manifest": {"version": "0.9.0", "issuer_class": "law", "issuer": "ec-espr", "signature": {"signature": "ab01"}},
         "version": "0.9.0",
         "effective_from": "2026-10-18T00:00:00Z"
     });
@@ -269,6 +270,7 @@ async fn supersession_chain() {
         "item_id": "historic-vehicle",
         "class": "profile",
         "definition": "Historic vehicle profile",
+        "manifest": {"version": "1.0.0", "issuer_class": "law", "issuer": "ec-espr", "signature": {"signature": "ab01"}},
         "version": "1.0.0",
         "effective_from": "2018-06-01T00:00:00Z"
     });
@@ -358,6 +360,7 @@ async fn applicability_retroactivity_and_windows() {
                 "item_id": id,
                 "class": "profile",
                 "definition": "profile",
+                "manifest": {"version": "1.0.0", "issuer_class": "law", "issuer": "ec-espr", "signature": {"signature": "ab01"}},
                 "version": "1.0.0",
                 "effective_from": from
             }),
@@ -488,6 +491,7 @@ async fn admin_auth_and_mutation_audit() {
         "item_id": "jp-meti-electronics",
         "class": "profile",
         "definition": "JP METI electronics profile",
+        "manifest": {"version": "1.0.0", "issuer_class": "law", "issuer": "ec-espr", "signature": {"signature": "ab01"}},
         "version": "1.0.0",
         "effective_from": "2026-01-01T00:00:00Z"
     });
@@ -613,19 +617,27 @@ async fn subregisters_are_class_scoped() {
         ("/trust-anchors", "ta-nist", "trust-anchor"),
         ("/data-elements", "dp-recycled-content", "data-element"),
     ] {
-        let resp = post(
-            base,
-            path,
-            &json!({
-                "register_id": REGISTER,
-                "item_id": id,
-                "definition": "test item",
+        // Profiles carry their signed manifest (PR-1); the other
+        // classes need none.
+        let manifest = (class == "profile").then(|| {
+            json!({
                 "version": "1.0.0",
-                "effective_from": "2026-01-01T00:00:00Z"
-            }),
-            None,
-        )
-        .await;
+                "issuer_class": "law",
+                "issuer": "ec-espr",
+                "signature": {"signature": "ab01"}
+            })
+        });
+        let mut body = json!({
+            "register_id": REGISTER,
+            "item_id": id,
+            "definition": "test item",
+            "version": "1.0.0",
+            "effective_from": "2026-01-01T00:00:00Z"
+        });
+        if let (Some(b), Some(m)) = (body.as_object_mut(), manifest) {
+            b.insert("manifest".into(), m);
+        }
+        let resp = post(base, path, &body, None).await;
         assert_eq!(resp.status, 201);
         assert_eq!(json_of(&resp)["item_class"], class);
     }
@@ -695,6 +707,7 @@ async fn journal_replays_state_across_restart() {
                     "item_id": "eu-espr-textiles",
                     "class": "profile",
                     "definition": "EU ESPR textiles profile",
+                    "manifest": {"version": "0.9.0", "issuer_class": "law", "issuer": "ec-espr", "signature": {"signature": "ab01"}},
                     "version": "0.9.0",
                     "effective_from": "2026-10-18T00:00:00Z"
                 }),

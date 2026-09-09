@@ -72,6 +72,7 @@ pub trait IntakeCheck: Sync {
 /// The registered chain. New checks are appended here.
 pub fn default_chain() -> Vec<Box<dyn IntakeCheck>> {
     vec![
+        Box::new(ProfileSignatureCheck),
         Box::new(ProfileManifestSchemaCheck),
         Box::new(ProfileSatisfiabilityCheck),
         Box::new(CrossRegisterMappingCheck),
@@ -98,6 +99,87 @@ pub fn run(
         warnings.append(&mut w);
     }
     Ok(warnings)
+}
+
+// ---------------------------------------------------------------------------
+// PR-1 — profiles register only in their SIGNED form
+// ---------------------------------------------------------------------------
+
+/// A profile item's manifest must carry the signed form: the issuer
+/// class (the five-class authority typology), the issuing node, and
+/// a signature slot WITH a signature value. This check enforces the
+/// FORM (the registry holds no trust graph); the cryptographic
+/// reading — signature verified against the issuer's registered key
+/// and graded by the class — is the trust service's
+/// (`GET /keyring`, SIGNATIF's `SignedProfile::verify`).
+pub struct ProfileSignatureCheck;
+
+const ISSUER_CLASSES: [&str; 5] = ["law", "treaty", "consensus", "declaration", "attestation"];
+
+impl IntakeCheck for ProfileSignatureCheck {
+    fn name(&self) -> &'static str {
+        "profile-signature-required"
+    }
+
+    fn class(&self) -> Option<ItemClass> {
+        Some(ItemClass::Profile)
+    }
+
+    fn check(
+        &self,
+        item: &Item,
+        _ctx: &IntakeContext,
+    ) -> Result<Vec<IntakeWarning>, Vec<IntakeError>> {
+        let Some(m) = &item.manifest else {
+            return Err(vec![IntakeError {
+                check: "profile-signature-required",
+                path: "manifest".into(),
+                message: "a profile item registers its SIGNED manifest (issuer_class, issuer, signature) — no manifest given".into(),
+            }]);
+        };
+        let mut errors = Vec::new();
+        match m.get("issuer_class").and_then(|v| v.as_str()) {
+            Some(token) if ISSUER_CLASSES.contains(&token) => {}
+            Some(other) => errors.push(IntakeError {
+                check: "profile-signature-required",
+                path: "manifest.issuer_class".into(),
+                message: format!(
+                    "`{other}` is not an issuer class (one of {})",
+                    ISSUER_CLASSES.join(", ")
+                ),
+            }),
+            None => errors.push(IntakeError {
+                check: "profile-signature-required",
+                path: "manifest.issuer_class".into(),
+                message: "profiles are signed by their issuer: the manifest must state its issuer_class (law | treaty | consensus | declaration | attestation)".into(),
+            }),
+        }
+        match m.get("issuer").and_then(|v| v.as_str()) {
+            Some(issuer) if !issuer.trim().is_empty() => {}
+            _ => errors.push(IntakeError {
+                check: "profile-signature-required",
+                path: "manifest.issuer".into(),
+                message: "the issuing node's id is required (the signer of record)".into(),
+            }),
+        }
+        let signature_filled = m
+            .get("signature")
+            .and_then(|v| v.get("signature"))
+            .map(|v| v.as_str().map(|s| !s.trim().is_empty()).unwrap_or(false))
+            .unwrap_or(false);
+        if !signature_filled {
+            errors.push(IntakeError {
+                check: "profile-signature-required",
+                path: "manifest.signature".into(),
+                message: "profiles register only in their SIGNED form: a signature slot with a signature value is required (the cryptographic reading is the trust service's)".into(),
+            });
+        }
+        if errors.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Err(errors)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -334,7 +416,12 @@ mod tests {
         let profile = item(
             "p",
             ItemClass::Profile,
-            Some(json!({"data_points": [{"min_capability": "S9"}]})),
+            Some(json!({
+                "issuer_class": "law",
+                "issuer": "ec-espr",
+                "signature": {"signature": "ab01"},
+                "data_points": [{"min_capability": "S9"}]
+            })),
         );
         let e = run(&default_chain(), &profile, &ctx).unwrap_err();
         assert!(e.iter().all(|x| x.check == "profile-manifest-schema"));
@@ -346,6 +433,9 @@ mod tests {
         let store = Store::open(None).unwrap();
         let manifest = json!({
             "version": "1.0.0",
+            "issuer_class": "law",
+            "issuer": "ec-espr",
+            "signature": {"signature": "ab01"},
             "subject_capability": "S0",
             "data_points": [{"element": "de/x", "min_capability": "S3"}]
         });
@@ -365,6 +455,80 @@ mod tests {
             .iter()
             .any(|x| x.check == "profile-satisfiability"
                 && x.path == "data_points[0].min_capability"));
+    }
+
+    #[test]
+    fn profiles_register_only_in_their_signed_form() {
+        let store = Store::open(None).unwrap();
+        let strict = IntakeContext {
+            store: &store,
+            strict: true,
+        };
+        // Unsigned: refused, naming every missing piece.
+        let unsigned = item(
+            "p-unsigned",
+            ItemClass::Profile,
+            Some(json!({"version": "1.0.0"})),
+        );
+        let e = run(&default_chain(), &unsigned, &strict).unwrap_err();
+        assert!(e.iter().all(|x| x.check == "profile-signature-required"));
+        assert!(e.iter().any(|x| x.path == "manifest.issuer_class"));
+        assert!(e.iter().any(|x| x.path == "manifest.issuer"));
+        assert!(e.iter().any(|x| x.path == "manifest.signature"));
+
+        // Wrong class token: refused.
+        let wrong_class = item(
+            "p-wrong",
+            ItemClass::Profile,
+            Some(json!({
+                "issuer_class": "royal-decree",
+                "issuer": "ec-espr",
+                "signature": {"signature": "ab01"},
+                "version": "1.0.0"
+            })),
+        );
+        let e = run(&default_chain(), &wrong_class, &strict).unwrap_err();
+        assert!(e
+            .iter()
+            .any(|x| x.path == "manifest.issuer_class" && x.message.contains("royal-decree")));
+
+        // A framed-only slot (no signature VALUE) is still unsigned.
+        let framed = item(
+            "p-framed",
+            ItemClass::Profile,
+            Some(json!({
+                "issuer_class": "attestation",
+                "issuer": "tuv",
+                "signature": {"signature": ""},
+                "version": "1.0.0"
+            })),
+        );
+        assert!(run(&default_chain(), &framed, &strict).is_err());
+
+        // The signed shape passes this check (schema/satisfiability
+        // are the NEXT checks' concern).
+        let signed = item(
+            "p-signed",
+            ItemClass::Profile,
+            Some(json!({
+                "issuer_class": "attestation",
+                "issuer": "tuv",
+                "signature": {"signature": "ab01"},
+                "version": "1.0.0",
+                "subject_capability": "S0",
+                "data_points": [{"element": "de/x", "min_capability": "S0"}]
+            })),
+        );
+        let outcome = run(&default_chain(), &signed, &strict);
+        assert!(
+            outcome.is_ok()
+                || outcome
+                    .err()
+                    .unwrap()
+                    .iter()
+                    .all(|x| x.check != "profile-signature-required"),
+            "the signed form passes the signature gate"
+        );
     }
 
     #[test]

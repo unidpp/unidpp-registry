@@ -86,6 +86,9 @@ async fn profile_manifest_schema_is_served() {
 fn material_loop_manifest() -> Value {
     json!({
         "version": "1.0.0",
+        "issuer_class": "law",
+        "issuer": "ec-espr",
+        "signature": {"signature": "ab01"},
         "axes": ["characteristic"],
         "issuing_role": "manufacturer",
         "custody": {"default_model": "mass_balance", "standard": "ISO 22095:2020"},
@@ -124,6 +127,9 @@ fn material_loop_manifest() -> Value {
 fn lens_manifest() -> Value {
     json!({
         "version": "1.0.0",
+        "issuer_class": "consensus",
+        "issuer": "battery-consortium",
+        "signature": {"signature": "ab01"},
         "profile": {
             "id": "urn:unidpp:profile:lens",
             "axes": {"jurisdiction": "EU"},
@@ -252,6 +258,9 @@ async fn profile_manifest_intake_validates_with_field_paths() {
 async fn seed_clock_profile(base: &str) {
     let manifest = json!({
         "version": "1.0.0",
+        "issuer_class": "law",
+        "issuer": "national-heritage",
+        "signature": {"signature": "ab01"},
         "axes": ["characteristic"],
         "triggers": [
             {
@@ -765,6 +774,9 @@ async fn satisfiability_rejects_unservable_capability_demands() {
     let demanding = |subject: &str| {
         json!({
             "version": "1.0.0",
+            "issuer_class": "law",
+            "issuer": "ec-espr",
+            "signature": {"signature": "ab01"},
             "subject_capability": subject,
             "data_points": [
                 {"element": "de/live-state", "min_capability": "S3", "fresh_within": "P1D"}
@@ -834,6 +846,9 @@ async fn satisfiability_rejects_unservable_capability_demands() {
     // Bounded freshness alone is unsatisfiable on S1 too.
     let mut s1 = json!({
         "version": "1.0.0",
+        "issuer_class": "law",
+        "issuer": "ec-espr",
+        "signature": {"signature": "ab01"},
         "subject_capability": "S1",
         "data_points": [{"element": "de/x", "min_capability": "S0", "fresh_within": "PT6H"}]
     });

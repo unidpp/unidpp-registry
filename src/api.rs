@@ -496,7 +496,7 @@ async fn discovery() -> Result<Response, Response> {
             "service_descriptor_signature": "Ed25519 over canonical-JSON of body (signature block excluded); operator id is content-derived from the public key",
             "operator_keyring": "seeded dev keyring: unidpp-{registry,issuer,resolver,trust,log,archive,cli-verifier,edge}; loaded at startup; signatures are verified at intake only (replay re-applies the stored record)"
         },
-        "intake_checks": ["profile-manifest-schema", "profile-satisfiability", "cross-register-mapping-integrity"],
+        "intake_checks": ["profile-signature-required", "profile-manifest-schema", "profile-satisfiability", "cross-register-mapping-integrity"],
         "model_validation": "expressir (gem install expressir; `expressir validate load` run as a subprocess); deposits without expressir on PATH are stored with validation.status = pending",
         "auth": "mutations require a Bearer token when UNIDPP_REGISTRY_ADMIN_TOKEN is set"
     });
