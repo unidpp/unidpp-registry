@@ -1,0 +1,1032 @@
+components: {}
+info:
+  description: 'UniDPP ISO 19135 register service: item registration, version supersession, point-in-time resolution, applicability bindings, EXPRESS model deposits, and the discovery registry (C3 services, C4 protocol bindings, C5 verification mechanisms). Reads are public; mutations require `Authorization: Bearer <UNIDPP_REGISTRY_ADMIN_TOKEN>` where a token is configured. Collection reads are content-negotiated (`Accept: text/cddal` serves the canonical dictionary form). The class-generic subregister surface is mounted at each item class''s plural (data-elements, profiles, crypto-suites, transforms, trust-anchors, units) and is spoken here under the `{class}` templates.'
+  license:
+    identifier: Apache-2.0
+    name: Apache-2.0
+  title: UniDPP registry
+  version: 0.1.0
+  x-unidpp-env-keys:
+  - UNIDPP_REGISTRY_BIND
+  - UNIDPP_REGISTRY_ADMIN_TOKEN
+  - UNIDPP_REGISTRY_STATE_FILE
+  - UNIDPP_REGISTRY_SEED_ON_DEMAND
+  - UNIDPP_REGISTRY_SEED_EXPRESS
+openapi: 3.1.0
+paths:
+  /:
+    get:
+      operationId: discovery
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: 'The discovery document: endpoint references, item classes, statuses, subregister mounts, as-of semantics, content negotiation, intake checks and the auth posture'
+      summary: Serve the discovery document.
+      tags:
+      - register
+  /admin/log:
+    get:
+      operationId: admin_log
+      parameters:
+      - description: Records to return (default 100, maximum 10 000)
+        in: query
+        name: limit
+        required: false
+        schema:
+          format: int64
+          minimum: 0
+          type: integer
+      - description: Records to skip (default 0)
+        in: query
+        name: offset
+        required: false
+        schema:
+          format: int64
+          minimum: 0
+          type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: The journal window
+        '401':
+          description: A bearer token is configured and the request does not carry it
+      summary: |-
+        GET /admin/log — the append-only audit log (admin, paged).
+        Read the append-only audit log.
+      tags:
+      - admin
+  /admin/seed:
+    post:
+      operationId: admin_seed
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: The seed report
+        '401':
+          description: A bearer token is configured and the request does not carry it
+        '403':
+          description: Seeding on demand is disabled
+      summary: |-
+        `POST /admin/seed` — idempotent: populates the seed dataset only once
+        per process (or until the journal is wiped). Returns a summary of
+        counts registered. Disabled with `UNIDPP_REGISTRY_SEED_ON_DEMAND=0`.
+        Seed the register with the development corpus (refused when
+        `UNIDPP_REGISTRY_SEED_ON_DEMAND` is off).
+      tags:
+      - admin
+  /applicability:
+    get:
+      operationId: applicability_query
+      parameters:
+      - description: 'The product type (alias: `subject`)'
+        in: query
+        name: product_type
+        required: false
+        schema:
+          type: string
+      - description: 'An RFC 3339 instant (alias: `asof`)'
+        in: query
+        name: at
+        required: false
+        schema:
+          type: string
+      - description: A JSON object of subject facts for predicate evaluation
+        in: query
+        name: subject_facts
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: The applicability evaluation, as-of stamped
+        '400':
+          description: A missing `product_type` or malformed `subject_facts`
+      summary: |-
+        GET /applicability?product_type=&at=&subject_facts= — which
+        profiles applied at `at` (legal as-of semantics: retroactive
+        bindings apply from their `effective_from`; non-retroactive ones
+        only from `registered_at`). With `subject_facts` (a JSON object),
+        clock predicates on the bound profiles' manifests are evaluated
+        at the query instant: a time-triggered profile binds only once
+        its threshold (`basis + duration`) is crossed. Fact predicates
+        are evaluated locally by the subject's custodian, never here.
+        Evaluate applicability bindings for a product type, optionally
+        against supplied subject facts (the clock predicates run against
+        the facts).
+      tags:
+      - applicability
+    post:
+      operationId: bind_applicability
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        description: 'The binding: `{product_type, profile_id, ...window and retroactivity fields}`; or an evaluation request `{product_type, subject_facts, at?}`'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: The evaluation result (when the body is an evaluation request)
+        '201':
+          content:
+            application/json:
+              schema: {}
+          description: Bound; the binding view is stated
+        '400':
+          description: An invalid body, or `subject_facts` combined with `profile_id`
+        '401':
+          description: A bearer token is configured and the request does not carry it
+      summary: |-
+        POST /applicability — bind a profile to a product type with an
+        effective window and a retroactivity flag.
+        Bind a profile to a product type with an effective window and a
+        retroactivity flag. A body carrying `subject_facts` and no
+        `profile_id` is an evaluation request, not a mutation.
+      tags:
+      - applicability
+  /cross-register-mappings:
+    get:
+      operationId: mappings_get_or_list
+      parameters:
+      - description: 'Directional lookup: the mapped item'
+        in: query
+        name: item
+        required: false
+        schema:
+          type: string
+      - description: 'Directional lookup: the source register'
+        in: query
+        name: source
+        required: false
+        schema:
+          type: string
+      - description: 'Directional lookup: the target register'
+        in: query
+        name: target
+        required: false
+        schema:
+          type: string
+      - description: Filter by register id
+        in: query
+        name: register
+        required: false
+        schema:
+          type: string
+      - description: 'An RFC 3339 instant (alias: `asof`)'
+        in: query
+        name: at
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: The listing or the directional result, as-of stamped
+      summary: |-
+        GET /cross-register-mappings — with `item`/`source`/`target`
+        filters, the directional lookup; without them, the generic
+        class-scoped listing (content-negotiated like every listing).
+        List cross-register mappings; with `item`, `source` or `target`
+        present this is the directional lookup.
+      tags:
+      - register
+    post:
+      operationId: mappings_create
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        description: The mapping item and its first version
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: {}
+          description: Registered; the item view is stated
+        '400':
+          description: An invalid body or a failed mapping-integrity check
+        '401':
+          description: A bearer token is configured and the request does not carry it
+        '409':
+          description: The mapping is already registered
+      summary: |-
+        Register a cross-register mapping (ISO 19135 harmonization: a
+        mapping between items of two registers is itself a registered
+        item).
+      tags:
+      - register
+  /cross-register-mappings/{id}:
+    get:
+      operationId: mappings_get_one
+      parameters:
+      - description: The mapping identifier
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      - description: 'An RFC 3339 instant (alias: `asof`)'
+        in: query
+        name: at
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: The mapping view, as-of stamped
+        '404':
+          description: No such mapping as of the requested instant
+      summary: Retrieve one cross-register mapping as of an instant.
+      tags:
+      - register
+  /cross-register-mappings/{id}/supersession:
+    get:
+      operationId: mappings_chain
+      parameters:
+      - description: The mapping identifier
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      - description: Start the chain at this version
+        in: query
+        name: from
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: The chain, as-of stamped
+        '404':
+          description: No such mapping
+      summary: The supersession chain of a cross-register mapping.
+      tags:
+      - register
+  /cross-register-mappings/{id}/versions:
+    post:
+      operationId: mappings_supersede_one
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        description: The successor version and its manifest
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: {}
+          description: Superseded; the new version, the superseded version and the item view are stated
+        '400':
+          description: No valid version to supersede or an invalid body
+        '401':
+          description: A bearer token is configured and the request does not carry it
+      summary: Supersede a cross-register mapping with a new version.
+      tags:
+      - register
+  /healthz:
+    get:
+      operationId: healthz
+      responses:
+        '200':
+          description: The service is serving
+      summary: Liveness probe.
+      tags:
+      - register
+  /items:
+    get:
+      operationId: list_all_items
+      parameters:
+      - description: Filter by item class
+        in: query
+        name: class
+        required: false
+        schema:
+          type: string
+      - description: Filter by register id
+        in: query
+        name: register
+        required: false
+        schema:
+          type: string
+      - description: 'An RFC 3339 instant; the listing is stated as of that instant (alias: `asof`)'
+        in: query
+        name: at
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: The listing, as-of stamped
+      summary: |-
+        List registered items (content-negotiated; `Accept: text/cddal`
+        serves the canonical dictionary form).
+      tags:
+      - register
+    post:
+      operationId: create_items
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        description: 'The item and its first version: `{register_id, item_id, class, definition, version, status: valid}`'
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: {}
+          description: Registered; the item view is stated
+        '400':
+          description: An invalid body or a failed intake check
+        '401':
+          description: A bearer token is configured and the request does not carry it
+        '409':
+          description: The item is already registered
+      summary: Register a new ISO 19135 item with its first version.
+      tags:
+      - register
+  /items/{id}:
+    get:
+      operationId: get_one_item
+      parameters:
+      - description: The item identifier
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      - description: 'An RFC 3339 instant (alias: `asof`)'
+        in: query
+        name: at
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: The item view, as-of stamped
+        '404':
+          description: No such item as of the requested instant
+      summary: Retrieve one item as of an instant.
+      tags:
+      - register
+  /items/{id}/supersession:
+    get:
+      operationId: one_item_chain
+      parameters:
+      - description: The item identifier
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      - description: Start the chain at this version
+        in: query
+        name: from
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: The chain, as-of stamped
+        '404':
+          description: No such item
+      summary: The supersession chain of an item.
+      tags:
+      - register
+  /items/{id}/versions:
+    post:
+      operationId: supersede_one_item
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        description: The successor version and its manifest; an explicit `supersede_version` names the version to supersede, otherwise the current valid version is superseded
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: {}
+          description: Superseded; the new version, the superseded version and the item view are stated
+        '400':
+          description: No valid version to supersede, a manifest pin that matches no registered version, or an invalid body
+        '401':
+          description: A bearer token is configured and the request does not carry it
+      summary: |-
+        Supersede an item's current version with a new one
+        (append-only; the window of the superseded version closes).
+      tags:
+      - register
+  /models:
+    get:
+      operationId: list_models
+      parameters:
+      - description: Filter by register id
+        in: query
+        name: register
+        required: false
+        schema:
+          type: string
+      - description: 'An RFC 3339 instant (alias: `asof`)'
+        in: query
+        name: at
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: The listing, as-of stamped
+      summary: |-
+        GET /models — list deposited models with their validation status.
+        List deposited models.
+      tags:
+      - models
+    post:
+      operationId: deposit_model
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        description: '`{register_id, item_id, title, version, source, submitting_organization?}`'
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: {}
+          description: Deposited; the content hash and the validation status are stated
+        '400':
+          description: An invalid body or a rejected (invalid) model
+        '401':
+          description: A bearer token is configured and the request does not carry it
+        '409':
+          description: The model is already deposited
+      summary: |-
+        POST /models — deposit an EXPRESS model: source text + metadata;
+        content hash over the exact bytes; expressir validation
+        (subprocess; `pending` when the binary is absent; `invalid`
+        deposits are rejected).
+        Deposit an EXPRESS (or CDDAL) semantic model: source text plus
+        metadata; the content hash covers the exact bytes and expressir
+        validates the source (pending when the binary is absent; invalid
+        deposits are rejected).
+      tags:
+      - models
+  /models/{id}:
+    get:
+      operationId: get_model
+      parameters:
+      - description: The model identifier
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      - description: 'An RFC 3339 instant (alias: `asof`)'
+        in: query
+        name: at
+        required: false
+        schema:
+          type: string
+      - description: Pin the retrieval to this content hash
+        in: query
+        name: hash
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: The model record, as-of stamped
+        '404':
+          description: No such model, or the pinned hash matches no deposit
+      summary: |-
+        GET /models/{id}?at=&hash= — the deposited source, its content
+        hash and validation status. With `hash=`, retrieval is pinned to
+        that hash (mismatch → 409).
+        Retrieve a deposited model; hash-pinned retrieval names an exact
+        byte form.
+      tags:
+      - models
+  /models/{id}/validate:
+    post:
+      operationId: validate_model
+      parameters:
+      - description: The model identifier
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: The validation report
+        '401':
+          description: A bearer token is configured and the request does not carry it
+        '404':
+          description: No such model
+      summary: |-
+        POST /models/{id}/validate — re-run expressir validation over the
+        stored source and record the outcome (the degrade path: deposits
+        stored `pending` become `valid`/`invalid` once expressir is
+        available).
+        Re-run expressir validation over a deposited model.
+      tags:
+      - models
+  /protocol-bindings:
+    get:
+      operationId: list_protocol_bindings
+      parameters:
+      - description: 'An RFC 3339 instant (alias: `asof`)'
+        in: query
+        name: at
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: The listing, as-of stamped
+      summary: |-
+        `GET /protocol-bindings` — list all registered protocol bindings.
+        List registered C4 protocol bindings.
+      tags:
+      - discovery
+    post:
+      operationId: create_protocol_binding
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        description: The signed protocol binding descriptor
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: {}
+          description: Registered; the stored record is stated
+        '400':
+          description: The descriptor or its signature fails the intake checks
+        '401':
+          description: A bearer token is configured and the request does not carry it
+      summary: |-
+        `POST /protocol-bindings` — register a signed C4 protocol binding.
+        Register a signed C4 protocol binding descriptor.
+      tags:
+      - discovery
+  /protocol-bindings/{id}:
+    get:
+      operationId: get_protocol_binding
+      parameters:
+      - description: The protocol binding identifier
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: The descriptor
+        '404':
+          description: No such protocol binding
+      summary: |-
+        `GET /protocol-bindings/{id}` — a single protocol binding.
+        Retrieve one C4 protocol binding descriptor.
+      tags:
+      - discovery
+  /schemas/profile-manifest:
+    get:
+      operationId: get_profile_manifest_schema
+      parameters:
+      - description: 'An RFC 3339 instant for the as-of stamp (alias: `asof`)'
+        in: query
+        name: at
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/schema+json:
+              schema: {}
+          description: The JSON Schema, as-of stamped
+      summary: |-
+        GET /schemas/profile-manifest — the JSON Schema (draft 2020-12)
+        generated from the canonical manifest model. The `as_of` member
+        is serving metadata (not a validation keyword; draft 2020-12
+        validators ignore it); the schema version rides in `$id`.
+        The generated JSON Schema of a profile manifest.
+      tags:
+      - register
+  /services:
+    get:
+      operationId: list_services
+      parameters:
+      - description: Filter by service class
+        in: query
+        name: class
+        required: false
+        schema:
+          type: string
+      - description: Filter by jurisdiction
+        in: query
+        name: jurisdiction
+        required: false
+        schema:
+          type: string
+      - description: 'An RFC 3339 instant (alias: `asof`)'
+        in: query
+        name: at
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: The listing, as-of stamped
+      summary: |-
+        `GET /services` — list services with optional `class=` and
+        `jurisdiction=` filters and `at=` point-in-time semantics.
+        List registered C3 service descriptors.
+      tags:
+      - discovery
+    post:
+      operationId: create_service
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        description: The signed service descriptor
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: {}
+          description: Registered; the stored record is stated
+        '400':
+          description: The descriptor or its signature fails the intake checks
+        '401':
+          description: A bearer token is configured and the request does not carry it
+      summary: |-
+        `POST /services` — register a signed C3 service descriptor.
+        Register a signed C3 service descriptor (the signature is
+        verified against the operator keyring at intake).
+      tags:
+      - discovery
+  /services/{id}:
+    get:
+      operationId: get_service
+      parameters:
+      - description: The service identifier
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      - description: 'An RFC 3339 instant (alias: `asof`)'
+        in: query
+        name: at
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: The descriptor, as-of stamped
+        '404':
+          description: No such service as of the requested instant
+      summary: |-
+        `GET /services/{id}` — a single service descriptor with the version
+        in force at `at`.
+        Retrieve one C3 service descriptor as of an instant.
+      tags:
+      - discovery
+  /services/{id}/supersession:
+    get:
+      operationId: service_chain
+      parameters:
+      - description: The service identifier
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      - description: Start the chain at this version
+        in: query
+        name: from
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: The chain, as-of stamped
+        '404':
+          description: No such service
+      summary: |-
+        `GET /services/{id}/supersession` — the supersession chain for a
+        service descriptor.
+        The supersession chain of a C3 service descriptor.
+      tags:
+      - discovery
+  /services/{id}/versions:
+    post:
+      operationId: supersede_service
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        description: The signed successor descriptor
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: {}
+          description: Superseded; the stored record is stated
+        '400':
+          description: The descriptor or its signature fails the intake checks
+        '401':
+          description: A bearer token is configured and the request does not carry it
+      summary: |-
+        `POST /services/{id}/versions` — supersede a service descriptor
+        with a new signed version.
+        Supersede a C3 service descriptor with a new signed version.
+      tags:
+      - discovery
+  /verification-mechanisms:
+    get:
+      operationId: list_verification_mechanisms
+      parameters:
+      - description: 'An RFC 3339 instant (alias: `asof`)'
+        in: query
+        name: at
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: The listing, as-of stamped
+      summary: |-
+        `GET /verification-mechanisms` — list all registered verification
+        mechanisms.
+        List registered C5 verification mechanisms.
+      tags:
+      - discovery
+    post:
+      operationId: create_verification_mechanism
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        description: The signed verification mechanism descriptor
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: {}
+          description: Registered; the stored record is stated
+        '400':
+          description: The descriptor or its signature fails the intake checks
+        '401':
+          description: A bearer token is configured and the request does not carry it
+      summary: |-
+        `POST /verification-mechanisms` — register a signed C5 verification
+        mechanism.
+        Register a signed C5 verification mechanism descriptor.
+      tags:
+      - discovery
+  /verification-mechanisms/{id}:
+    get:
+      operationId: get_verification_mechanism
+      parameters:
+      - description: The verification mechanism identifier
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: The descriptor
+        '404':
+          description: No such verification mechanism
+      summary: |-
+        `GET /verification-mechanisms/{id}` — a single verification
+        mechanism.
+        Retrieve one C5 verification mechanism descriptor.
+      tags:
+      - discovery
+  /{class}:
+    get:
+      operationId: sub_list
+      parameters:
+      - description: The subregister's class plural
+        in: path
+        name: class
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: The listing, as-of stamped
+      summary: |-
+        List a subregister's items (content-negotiated;
+        `Accept: text/cddal` serves the canonical dictionary form).
+      tags:
+      - register
+    post:
+      operationId: sub_create
+      parameters:
+      - description: The subregister's class plural
+        in: path
+        name: class
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        description: The item and its first version
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: {}
+          description: Registered; the item view is stated
+        '400':
+          description: An invalid body or a failed intake check
+        '401':
+          description: A bearer token is configured and the request does not carry it
+        '409':
+          description: The item is already registered
+      summary: |-
+        Register an item in a class subregister (the class is the mount
+        point: data-elements, profiles, crypto-suites, transforms,
+        trust-anchors, units).
+      tags:
+      - register
+  /{class}/{id}:
+    get:
+      operationId: sub_get
+      parameters:
+      - description: The subregister's class plural
+        in: path
+        name: class
+        required: true
+        schema:
+          type: string
+      - description: The item identifier
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: The item view, as-of stamped
+        '404':
+          description: No such item as of the requested instant
+      summary: Retrieve one subregister item as of an instant.
+      tags:
+      - register
+  /{class}/{id}/supersession:
+    get:
+      operationId: sub_chain
+      parameters:
+      - description: The subregister's class plural
+        in: path
+        name: class
+        required: true
+        schema:
+          type: string
+      - description: The item identifier
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {}
+          description: The chain, as-of stamped
+        '404':
+          description: No such item
+      summary: The supersession chain of a subregister item.
+      tags:
+      - register
+  /{class}/{id}/versions:
+    post:
+      operationId: sub_supersede
+      parameters:
+      - description: The subregister's class plural
+        in: path
+        name: class
+        required: true
+        schema:
+          type: string
+      - description: The item identifier
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema: {}
+        description: The successor version and its manifest
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: {}
+          description: Superseded; the new version, the superseded version and the item view are stated
+        '400':
+          description: No valid version to supersede or an invalid body
+        '401':
+          description: A bearer token is configured and the request does not carry it
+      summary: Supersede a subregister item's current version.
+      tags:
+      - register
+tags:
+- description: 'The ISO 19135 register: items, subregisters, cross-register mappings, the manifest schema'
+  name: register
+- description: Profile-to-product-type bindings and their clock predicates
+  name: applicability
+- description: 'The discovery registry: C3 services, C4 protocol bindings, C5 verification mechanisms'
+  name: discovery
+- description: EXPRESS and CDDAL semantic model deposits
+  name: models
+- description: 'The operator surface: the audit log and seeding'
+  name: admin

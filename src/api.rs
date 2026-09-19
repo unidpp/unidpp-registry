@@ -33,6 +33,8 @@ use axum::routing::{get, post};
 use axum::{Extension, Router};
 use serde_json::{json, Map, Value};
 use tokio::net::TcpListener;
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
 
 use crate::cddal::{self, Representation};
 use crate::clock;
@@ -86,31 +88,49 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The environment variables this service consumes. This is the
+    /// deployment contract: unidpp-config renders exactly these names
+    /// for the registry, and the contract document carries them as
+    /// `x-unidpp-env-keys`.
+    pub const ENV_KEYS: &'static [&'static str] = &[
+        "UNIDPP_REGISTRY_BIND",
+        "UNIDPP_REGISTRY_ADMIN_TOKEN",
+        "UNIDPP_REGISTRY_STATE_FILE",
+        "UNIDPP_REGISTRY_SEED_ON_DEMAND",
+        "UNIDPP_REGISTRY_SEED_EXPRESS",
+    ];
+
     pub fn from_env() -> Config {
         let mut c = Config::default();
-        if let Ok(bind) = std::env::var("UNIDPP_REGISTRY_BIND") {
+        let mut vars: HashMap<&str, String> = HashMap::new();
+        for key in Self::ENV_KEYS {
+            if let Ok(value) = std::env::var(key) {
+                vars.insert(*key, value);
+            }
+        }
+        if let Some(bind) = vars.get("UNIDPP_REGISTRY_BIND") {
             match bind.parse() {
                 Ok(addr) => c.bind = addr,
                 Err(_) => eprintln!("unidpp-registry: ignoring bad UNIDPP_REGISTRY_BIND `{bind}`"),
             }
         }
-        if let Ok(token) = std::env::var("UNIDPP_REGISTRY_ADMIN_TOKEN") {
+        if let Some(token) = vars.get("UNIDPP_REGISTRY_ADMIN_TOKEN") {
             if !token.is_empty() {
-                c.admin_token = Some(token);
+                c.admin_token = Some(token.clone());
             }
         }
-        if let Ok(path) = std::env::var("UNIDPP_REGISTRY_STATE_FILE") {
+        if let Some(path) = vars.get("UNIDPP_REGISTRY_STATE_FILE") {
             if !path.is_empty() {
                 c.state_file = Some(PathBuf::from(path));
             }
         }
-        if let Ok(s) = std::env::var("UNIDPP_REGISTRY_SEED_ON_DEMAND") {
+        if let Some(s) = vars.get("UNIDPP_REGISTRY_SEED_ON_DEMAND") {
             c.seed_on_demand = !matches!(
                 s.trim().to_ascii_lowercase().as_str(),
                 "0" | "false" | "no" | "off"
             );
         }
-        if let Ok(s) = std::env::var("UNIDPP_REGISTRY_SEED_EXPRESS") {
+        if let Some(s) = vars.get("UNIDPP_REGISTRY_SEED_EXPRESS") {
             c.seed_express = !matches!(
                 s.trim().to_ascii_lowercase().as_str(),
                 "0" | "false" | "no" | "off"
@@ -435,6 +455,16 @@ fn find_item<'a>(
 // Handlers
 // ---------------------------------------------------------------------------
 
+/// Serve the discovery document.
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "register",
+    responses(
+        (status = 200, description = "The discovery document: endpoint references, item classes, statuses, subregister mounts, as-of semantics, content negotiation, intake checks and the auth posture", body = Value, content_type = "application/json"),
+    )
+)]
+
 async fn discovery() -> Result<Response, Response> {
     let mut subregisters = Map::new();
     for class in ItemClass::ALL {
@@ -502,6 +532,16 @@ async fn discovery() -> Result<Response, Response> {
     });
     Ok(stamped(StatusCode::OK, &doc, Timestamp::now()))
 }
+
+/// Liveness probe.
+#[utoipa::path(
+    get,
+    path = "/healthz",
+    tag = "register",
+    responses(
+        (status = 200, description = "The service is serving"),
+    )
+)]
 
 async fn healthz() -> Result<Response, Response> {
     Ok(build_response(
@@ -848,6 +888,22 @@ async fn item_chain(
 
 /// POST /applicability — bind a profile to a product type with an
 /// effective window and a retroactivity flag.
+/// Bind a profile to a product type with an effective window and a
+/// retroactivity flag. A body carrying `subject_facts` and no
+/// `profile_id` is an evaluation request, not a mutation.
+#[utoipa::path(
+    post,
+    path = "/applicability",
+    tag = "applicability",
+    request_body(content = Value, description = "The binding: `{product_type, profile_id, ...window and retroactivity fields}`; or an evaluation request `{product_type, subject_facts, at?}`"),
+    responses(
+        (status = 201, description = "Bound; the binding view is stated", body = Value, content_type = "application/json"),
+        (status = 200, description = "The evaluation result (when the body is an evaluation request)", body = Value, content_type = "application/json"),
+        (status = 400, description = "An invalid body, or `subject_facts` combined with `profile_id`"),
+        (status = 401, description = "A bearer token is configured and the request does not carry it"),
+    )
+)]
+
 async fn bind_applicability(
     State(app): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -928,6 +984,24 @@ async fn bind_applicability(
 /// at the query instant: a time-triggered profile binds only once
 /// its threshold (`basis + duration`) is crossed. Fact predicates
 /// are evaluated locally by the subject's custodian, never here.
+/// Evaluate applicability bindings for a product type, optionally
+/// against supplied subject facts (the clock predicates run against
+/// the facts).
+#[utoipa::path(
+    get,
+    path = "/applicability",
+    tag = "applicability",
+    params(
+        ("product_type" = Option<String>, Query, description = "The product type (alias: `subject`)"),
+        ("at" = Option<String>, Query, description = "An RFC 3339 instant (alias: `asof`)"),
+        ("subject_facts" = Option<String>, Query, description = "A JSON object of subject facts for predicate evaluation"),
+    ),
+    responses(
+        (status = 200, description = "The applicability evaluation, as-of stamped", body = Value, content_type = "application/json"),
+        (status = 400, description = "A missing `product_type` or malformed `subject_facts`"),
+    )
+)]
+
 async fn applicability_query(
     State(app): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -1052,6 +1126,21 @@ fn evaluate_applicability(
 }
 
 /// GET /admin/log — the append-only audit log (admin, paged).
+/// Read the append-only audit log.
+#[utoipa::path(
+    get,
+    path = "/admin/log",
+    tag = "admin",
+    params(
+        ("limit" = Option<u64>, Query, description = "Records to return (default 100, maximum 10 000)"),
+        ("offset" = Option<u64>, Query, description = "Records to skip (default 0)"),
+    ),
+    responses(
+        (status = 200, description = "The journal window", body = Value, content_type = "application/json"),
+        (status = 401, description = "A bearer token is configured and the request does not carry it"),
+    )
+)]
+
 async fn admin_log(
     State(app): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1091,6 +1180,20 @@ fn discovery_error(e: crate::discovery::DiscoveryError) -> Response {
 }
 
 /// `POST /services` — register a signed C3 service descriptor.
+/// Register a signed C3 service descriptor (the signature is
+/// verified against the operator keyring at intake).
+#[utoipa::path(
+    post,
+    path = "/services",
+    tag = "discovery",
+    request_body(content = Value, description = "The signed service descriptor"),
+    responses(
+        (status = 201, description = "Registered; the stored record is stated", body = Value, content_type = "application/json"),
+        (status = 400, description = "The descriptor or its signature fails the intake checks"),
+        (status = 401, description = "A bearer token is configured and the request does not carry it"),
+    )
+)]
+
 async fn create_service(
     State(app): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1177,6 +1280,21 @@ async fn create_service(
 
 /// `GET /services` — list services with optional `class=` and
 /// `jurisdiction=` filters and `at=` point-in-time semantics.
+/// List registered C3 service descriptors.
+#[utoipa::path(
+    get,
+    path = "/services",
+    tag = "discovery",
+    params(
+        ("class" = Option<String>, Query, description = "Filter by service class"),
+        ("jurisdiction" = Option<String>, Query, description = "Filter by jurisdiction"),
+        ("at" = Option<String>, Query, description = "An RFC 3339 instant (alias: `asof`)"),
+    ),
+    responses(
+        (status = 200, description = "The listing, as-of stamped", body = Value, content_type = "application/json"),
+    )
+)]
+
 async fn list_services(
     State(app): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -1211,6 +1329,21 @@ async fn list_services(
 
 /// `GET /services/{id}` — a single service descriptor with the version
 /// in force at `at`.
+/// Retrieve one C3 service descriptor as of an instant.
+#[utoipa::path(
+    get,
+    path = "/services/{id}",
+    tag = "discovery",
+    params(
+        ("id" = String, Path, description = "The service identifier"),
+        ("at" = Option<String>, Query, description = "An RFC 3339 instant (alias: `asof`)"),
+    ),
+    responses(
+        (status = 200, description = "The descriptor, as-of stamped", body = Value, content_type = "application/json"),
+        (status = 404, description = "No such service as of the requested instant"),
+    )
+)]
+
 async fn get_service(
     State(app): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -1230,6 +1363,19 @@ async fn get_service(
 
 /// `POST /services/{id}/versions` — supersede a service descriptor
 /// with a new signed version.
+/// Supersede a C3 service descriptor with a new signed version.
+#[utoipa::path(
+    post,
+    path = "/services/{id}/versions",
+    tag = "discovery",
+    request_body(content = Value, description = "The signed successor descriptor"),
+    responses(
+        (status = 201, description = "Superseded; the stored record is stated", body = Value, content_type = "application/json"),
+        (status = 400, description = "The descriptor or its signature fails the intake checks"),
+        (status = 401, description = "A bearer token is configured and the request does not carry it"),
+    )
+)]
+
 async fn supersede_service(
     State(app): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1350,6 +1496,21 @@ async fn supersede_service(
 
 /// `GET /services/{id}/supersession` — the supersession chain for a
 /// service descriptor.
+/// The supersession chain of a C3 service descriptor.
+#[utoipa::path(
+    get,
+    path = "/services/{id}/supersession",
+    tag = "discovery",
+    params(
+        ("id" = String, Path, description = "The service identifier"),
+        ("from" = Option<String>, Query, description = "Start the chain at this version"),
+    ),
+    responses(
+        (status = 200, description = "The chain, as-of stamped", body = Value, content_type = "application/json"),
+        (status = 404, description = "No such service"),
+    )
+)]
+
 async fn service_chain(
     State(app): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -1386,6 +1547,19 @@ async fn service_chain(
 }
 
 /// `POST /protocol-bindings` — register a signed C4 protocol binding.
+/// Register a signed C4 protocol binding descriptor.
+#[utoipa::path(
+    post,
+    path = "/protocol-bindings",
+    tag = "discovery",
+    request_body(content = Value, description = "The signed protocol binding descriptor"),
+    responses(
+        (status = 201, description = "Registered; the stored record is stated", body = Value, content_type = "application/json"),
+        (status = 400, description = "The descriptor or its signature fails the intake checks"),
+        (status = 401, description = "A bearer token is configured and the request does not carry it"),
+    )
+)]
+
 async fn create_protocol_binding(
     State(app): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1457,6 +1631,17 @@ async fn create_protocol_binding(
 }
 
 /// `GET /protocol-bindings` — list all registered protocol bindings.
+/// List registered C4 protocol bindings.
+#[utoipa::path(
+    get,
+    path = "/protocol-bindings",
+    tag = "discovery",
+    params(("at" = Option<String>, Query, description = "An RFC 3339 instant (alias: `asof`)")),
+    responses(
+        (status = 200, description = "The listing, as-of stamped", body = Value, content_type = "application/json"),
+    )
+)]
+
 async fn list_protocol_bindings(State(app): State<Arc<AppState>>) -> Result<Response, Response> {
     let as_of = Timestamp::now();
     let bindings: Vec<ProtocolBinding> = {
@@ -1476,6 +1661,18 @@ async fn list_protocol_bindings(State(app): State<Arc<AppState>>) -> Result<Resp
 }
 
 /// `GET /protocol-bindings/{id}` — a single protocol binding.
+/// Retrieve one C4 protocol binding descriptor.
+#[utoipa::path(
+    get,
+    path = "/protocol-bindings/{id}",
+    tag = "discovery",
+    params(("id" = String, Path, description = "The protocol binding identifier")),
+    responses(
+        (status = 200, description = "The descriptor", body = Value, content_type = "application/json"),
+        (status = 404, description = "No such protocol binding"),
+    )
+)]
+
 async fn get_protocol_binding(
     State(app): State<Arc<AppState>>,
     Path(identifier): Path<String>,
@@ -1493,6 +1690,19 @@ async fn get_protocol_binding(
 
 /// `POST /verification-mechanisms` — register a signed C5 verification
 /// mechanism.
+/// Register a signed C5 verification mechanism descriptor.
+#[utoipa::path(
+    post,
+    path = "/verification-mechanisms",
+    tag = "discovery",
+    request_body(content = Value, description = "The signed verification mechanism descriptor"),
+    responses(
+        (status = 201, description = "Registered; the stored record is stated", body = Value, content_type = "application/json"),
+        (status = 400, description = "The descriptor or its signature fails the intake checks"),
+        (status = 401, description = "A bearer token is configured and the request does not carry it"),
+    )
+)]
+
 async fn create_verification_mechanism(
     State(app): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1565,6 +1775,17 @@ async fn create_verification_mechanism(
 
 /// `GET /verification-mechanisms` — list all registered verification
 /// mechanisms.
+/// List registered C5 verification mechanisms.
+#[utoipa::path(
+    get,
+    path = "/verification-mechanisms",
+    tag = "discovery",
+    params(("at" = Option<String>, Query, description = "An RFC 3339 instant (alias: `asof`)")),
+    responses(
+        (status = 200, description = "The listing, as-of stamped", body = Value, content_type = "application/json"),
+    )
+)]
+
 async fn list_verification_mechanisms(
     State(app): State<Arc<AppState>>,
 ) -> Result<Response, Response> {
@@ -1591,6 +1812,18 @@ async fn list_verification_mechanisms(
 
 /// `GET /verification-mechanisms/{id}` — a single verification
 /// mechanism.
+/// Retrieve one C5 verification mechanism descriptor.
+#[utoipa::path(
+    get,
+    path = "/verification-mechanisms/{id}",
+    tag = "discovery",
+    params(("id" = String, Path, description = "The verification mechanism identifier")),
+    responses(
+        (status = 200, description = "The descriptor", body = Value, content_type = "application/json"),
+        (status = 404, description = "No such verification mechanism"),
+    )
+)]
+
 async fn get_verification_mechanism(
     State(app): State<Arc<AppState>>,
     Path(identifier): Path<String>,
@@ -1617,6 +1850,17 @@ async fn get_verification_mechanism(
 /// generated from the canonical manifest model. The `as_of` member
 /// is serving metadata (not a validation keyword; draft 2020-12
 /// validators ignore it); the schema version rides in `$id`.
+/// The generated JSON Schema of a profile manifest.
+#[utoipa::path(
+    get,
+    path = "/schemas/profile-manifest",
+    tag = "register",
+    params(("at" = Option<String>, Query, description = "An RFC 3339 instant for the as-of stamp (alias: `asof`)")),
+    responses(
+        (status = 200, description = "The JSON Schema, as-of stamped", body = Value, content_type = "application/schema+json"),
+    )
+)]
+
 async fn get_profile_manifest_schema(
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response, Response> {
@@ -1641,6 +1885,23 @@ async fn get_profile_manifest_schema(
 /// content hash over the exact bytes; expressir validation
 /// (subprocess; `pending` when the binary is absent; `invalid`
 /// deposits are rejected).
+/// Deposit an EXPRESS (or CDDAL) semantic model: source text plus
+/// metadata; the content hash covers the exact bytes and expressir
+/// validates the source (pending when the binary is absent; invalid
+/// deposits are rejected).
+#[utoipa::path(
+    post,
+    path = "/models",
+    tag = "models",
+    request_body(content = Value, description = "`{register_id, item_id, title, version, source, submitting_organization?}`"),
+    responses(
+        (status = 201, description = "Deposited; the content hash and the validation status are stated", body = Value, content_type = "application/json"),
+        (status = 400, description = "An invalid body or a rejected (invalid) model"),
+        (status = 401, description = "A bearer token is configured and the request does not carry it"),
+        (status = 409, description = "The model is already deposited"),
+    )
+)]
+
 async fn deposit_model(
     State(app): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1716,6 +1977,20 @@ async fn deposit_model(
 }
 
 /// GET /models — list deposited models with their validation status.
+/// List deposited models.
+#[utoipa::path(
+    get,
+    path = "/models",
+    tag = "models",
+    params(
+        ("register" = Option<String>, Query, description = "Filter by register id"),
+        ("at" = Option<String>, Query, description = "An RFC 3339 instant (alias: `asof`)"),
+    ),
+    responses(
+        (status = 200, description = "The listing, as-of stamped", body = Value, content_type = "application/json"),
+    )
+)]
+
 async fn list_models(
     State(app): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -1750,6 +2025,23 @@ async fn list_models(
 /// GET /models/{id}?at=&hash= — the deposited source, its content
 /// hash and validation status. With `hash=`, retrieval is pinned to
 /// that hash (mismatch → 409).
+/// Retrieve a deposited model; hash-pinned retrieval names an exact
+/// byte form.
+#[utoipa::path(
+    get,
+    path = "/models/{id}",
+    tag = "models",
+    params(
+        ("id" = String, Path, description = "The model identifier"),
+        ("at" = Option<String>, Query, description = "An RFC 3339 instant (alias: `asof`)"),
+        ("hash" = Option<String>, Query, description = "Pin the retrieval to this content hash"),
+    ),
+    responses(
+        (status = 200, description = "The model record, as-of stamped", body = Value, content_type = "application/json"),
+        (status = 404, description = "No such model, or the pinned hash matches no deposit"),
+    )
+)]
+
 async fn get_model(
     State(app): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -1790,6 +2082,19 @@ async fn get_model(
 /// stored source and record the outcome (the degrade path: deposits
 /// stored `pending` become `valid`/`invalid` once expressir is
 /// available).
+/// Re-run expressir validation over a deposited model.
+#[utoipa::path(
+    post,
+    path = "/models/{id}/validate",
+    tag = "models",
+    params(("id" = String, Path, description = "The model identifier")),
+    responses(
+        (status = 200, description = "The validation report", body = Value, content_type = "application/json"),
+        (status = 401, description = "A bearer token is configured and the request does not carry it"),
+        (status = 404, description = "No such model"),
+    )
+)]
+
 async fn validate_model(
     State(app): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1905,6 +2210,19 @@ async fn list_cross_register_mappings(
 /// `POST /admin/seed` — idempotent: populates the seed dataset only once
 /// per process (or until the journal is wiped). Returns a summary of
 /// counts registered. Disabled with `UNIDPP_REGISTRY_SEED_ON_DEMAND=0`.
+/// Seed the register with the development corpus (refused when
+/// `UNIDPP_REGISTRY_SEED_ON_DEMAND` is off).
+#[utoipa::path(
+    post,
+    path = "/admin/seed",
+    tag = "admin",
+    responses(
+        (status = 200, description = "The seed report", body = Value, content_type = "application/json"),
+        (status = 401, description = "A bearer token is configured and the request does not carry it"),
+        (status = 403, description = "Seeding on demand is disabled"),
+    )
+)]
+
 async fn admin_seed(
     State(app): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -2264,6 +2582,20 @@ fn seed_services() -> Vec<(String, ServiceDescriptor)> {
 // Route wiring
 // ---------------------------------------------------------------------------
 
+/// Register a new ISO 19135 item with its first version.
+#[utoipa::path(
+    post,
+    path = "/items",
+    tag = "register",
+    request_body(content = Value, description = "The item and its first version: `{register_id, item_id, class, definition, version, status: valid}`"),
+    responses(
+        (status = 201, description = "Registered; the item view is stated", body = Value, content_type = "application/json"),
+        (status = 400, description = "An invalid body or a failed intake check"),
+        (status = 401, description = "A bearer token is configured and the request does not carry it"),
+        (status = 409, description = "The item is already registered"),
+    )
+)]
+
 async fn create_items(
     state: State<Arc<AppState>>,
     headers: HeaderMap,
@@ -2271,6 +2603,22 @@ async fn create_items(
 ) -> Result<Response, Response> {
     create_item(state, headers, body, None).await
 }
+
+/// List registered items (content-negotiated; `Accept: text/cddal`
+/// serves the canonical dictionary form).
+#[utoipa::path(
+    get,
+    path = "/items",
+    tag = "register",
+    params(
+        ("class" = Option<String>, Query, description = "Filter by item class"),
+        ("register" = Option<String>, Query, description = "Filter by register id"),
+        ("at" = Option<String>, Query, description = "An RFC 3339 instant; the listing is stated as of that instant (alias: `asof`)"),
+    ),
+    responses(
+        (status = 200, description = "The listing, as-of stamped", body = Value, content_type = "application/json"),
+    )
+)]
 
 async fn list_all_items(
     state: State<Arc<AppState>>,
@@ -2280,6 +2628,21 @@ async fn list_all_items(
     list_items(state, headers, query, None).await
 }
 
+/// Retrieve one item as of an instant.
+#[utoipa::path(
+    get,
+    path = "/items/{id}",
+    tag = "register",
+    params(
+        ("id" = String, Path, description = "The item identifier"),
+        ("at" = Option<String>, Query, description = "An RFC 3339 instant (alias: `asof`)"),
+    ),
+    responses(
+        (status = 200, description = "The item view, as-of stamped", body = Value, content_type = "application/json"),
+        (status = 404, description = "No such item as of the requested instant"),
+    )
+)]
+
 async fn get_one_item(
     state: State<Arc<AppState>>,
     query: Query<HashMap<String, String>>,
@@ -2287,6 +2650,20 @@ async fn get_one_item(
 ) -> Result<Response, Response> {
     get_item(state, query, path, None).await
 }
+
+/// Supersede an item's current version with a new one
+/// (append-only; the window of the superseded version closes).
+#[utoipa::path(
+    post,
+    path = "/items/{id}/versions",
+    tag = "register",
+    request_body(content = Value, description = "The successor version and its manifest; an explicit `supersede_version` names the version to supersede, otherwise the current valid version is superseded"),
+    responses(
+        (status = 201, description = "Superseded; the new version, the superseded version and the item view are stated", body = Value, content_type = "application/json"),
+        (status = 400, description = "No valid version to supersede, a manifest pin that matches no registered version, or an invalid body"),
+        (status = 401, description = "A bearer token is configured and the request does not carry it"),
+    )
+)]
 
 async fn supersede_one_item(
     state: State<Arc<AppState>>,
@@ -2297,6 +2674,21 @@ async fn supersede_one_item(
 ) -> Result<Response, Response> {
     supersede_item(state, headers, query, path, body, None).await
 }
+
+/// The supersession chain of an item.
+#[utoipa::path(
+    get,
+    path = "/items/{id}/supersession",
+    tag = "register",
+    params(
+        ("id" = String, Path, description = "The item identifier"),
+        ("from" = Option<String>, Query, description = "Start the chain at this version"),
+    ),
+    responses(
+        (status = 200, description = "The chain, as-of stamped", body = Value, content_type = "application/json"),
+        (status = 404, description = "No such item"),
+    )
+)]
 
 async fn one_item_chain(
     state: State<Arc<AppState>>,
@@ -2309,6 +2701,22 @@ async fn one_item_chain(
 // Cross-register-mapping subregister wrappers (class from the mount
 // point; the intake chain does the class's own validation).
 
+/// Register a cross-register mapping (ISO 19135 harmonization: a
+/// mapping between items of two registers is itself a registered
+/// item).
+#[utoipa::path(
+    post,
+    path = "/cross-register-mappings",
+    tag = "register",
+    request_body(content = Value, description = "The mapping item and its first version"),
+    responses(
+        (status = 201, description = "Registered; the item view is stated", body = Value, content_type = "application/json"),
+        (status = 400, description = "An invalid body or a failed mapping-integrity check"),
+        (status = 401, description = "A bearer token is configured and the request does not carry it"),
+        (status = 409, description = "The mapping is already registered"),
+    )
+)]
+
 async fn mappings_create(
     state: State<Arc<AppState>>,
     headers: HeaderMap,
@@ -2320,6 +2728,24 @@ async fn mappings_create(
 /// GET /cross-register-mappings — with `item`/`source`/`target`
 /// filters, the directional lookup; without them, the generic
 /// class-scoped listing (content-negotiated like every listing).
+/// List cross-register mappings; with `item`, `source` or `target`
+/// present this is the directional lookup.
+#[utoipa::path(
+    get,
+    path = "/cross-register-mappings",
+    tag = "register",
+    params(
+        ("item" = Option<String>, Query, description = "Directional lookup: the mapped item"),
+        ("source" = Option<String>, Query, description = "Directional lookup: the source register"),
+        ("target" = Option<String>, Query, description = "Directional lookup: the target register"),
+        ("register" = Option<String>, Query, description = "Filter by register id"),
+        ("at" = Option<String>, Query, description = "An RFC 3339 instant (alias: `asof`)"),
+    ),
+    responses(
+        (status = 200, description = "The listing or the directional result, as-of stamped", body = Value, content_type = "application/json"),
+    )
+)]
+
 async fn mappings_get_or_list(
     state: State<Arc<AppState>>,
     headers: HeaderMap,
@@ -2335,6 +2761,21 @@ async fn mappings_get_or_list(
     }
 }
 
+/// Retrieve one cross-register mapping as of an instant.
+#[utoipa::path(
+    get,
+    path = "/cross-register-mappings/{id}",
+    tag = "register",
+    params(
+        ("id" = String, Path, description = "The mapping identifier"),
+        ("at" = Option<String>, Query, description = "An RFC 3339 instant (alias: `asof`)"),
+    ),
+    responses(
+        (status = 200, description = "The mapping view, as-of stamped", body = Value, content_type = "application/json"),
+        (status = 404, description = "No such mapping as of the requested instant"),
+    )
+)]
+
 async fn mappings_get_one(
     state: State<Arc<AppState>>,
     query: Query<HashMap<String, String>>,
@@ -2342,6 +2783,19 @@ async fn mappings_get_one(
 ) -> Result<Response, Response> {
     get_item(state, query, path, Some(ItemClass::CrossRegisterMapping)).await
 }
+
+/// Supersede a cross-register mapping with a new version.
+#[utoipa::path(
+    post,
+    path = "/cross-register-mappings/{id}/versions",
+    tag = "register",
+    request_body(content = Value, description = "The successor version and its manifest"),
+    responses(
+        (status = 201, description = "Superseded; the new version, the superseded version and the item view are stated", body = Value, content_type = "application/json"),
+        (status = 400, description = "No valid version to supersede or an invalid body"),
+        (status = 401, description = "A bearer token is configured and the request does not carry it"),
+    )
+)]
 
 async fn mappings_supersede_one(
     state: State<Arc<AppState>>,
@@ -2361,6 +2815,21 @@ async fn mappings_supersede_one(
     .await
 }
 
+/// The supersession chain of a cross-register mapping.
+#[utoipa::path(
+    get,
+    path = "/cross-register-mappings/{id}/supersession",
+    tag = "register",
+    params(
+        ("id" = String, Path, description = "The mapping identifier"),
+        ("from" = Option<String>, Query, description = "Start the chain at this version"),
+    ),
+    responses(
+        (status = 200, description = "The chain, as-of stamped", body = Value, content_type = "application/json"),
+        (status = 404, description = "No such mapping"),
+    )
+)]
+
 async fn mappings_chain(
     state: State<Arc<AppState>>,
     query: Query<HashMap<String, String>>,
@@ -2371,6 +2840,23 @@ async fn mappings_chain(
 
 // Subregister wrappers (class from the mount point).
 
+/// Register an item in a class subregister (the class is the mount
+/// point: data-elements, profiles, crypto-suites, transforms,
+/// trust-anchors, units).
+#[utoipa::path(
+    post,
+    path = "/{class}",
+    tag = "register",
+    params(("class" = String, Path, description = "The subregister's class plural")),
+    request_body(content = Value, description = "The item and its first version"),
+    responses(
+        (status = 201, description = "Registered; the item view is stated", body = Value, content_type = "application/json"),
+        (status = 400, description = "An invalid body or a failed intake check"),
+        (status = 401, description = "A bearer token is configured and the request does not carry it"),
+        (status = 409, description = "The item is already registered"),
+    )
+)]
+
 async fn sub_create(
     state: State<Arc<AppState>>,
     Extension(class): Extension<ItemClass>,
@@ -2379,6 +2865,18 @@ async fn sub_create(
 ) -> Result<Response, Response> {
     create_item(state, headers, body, Some(class)).await
 }
+
+/// List a subregister's items (content-negotiated;
+/// `Accept: text/cddal` serves the canonical dictionary form).
+#[utoipa::path(
+    get,
+    path = "/{class}",
+    tag = "register",
+    params(("class" = String, Path, description = "The subregister's class plural")),
+    responses(
+        (status = 200, description = "The listing, as-of stamped", body = Value, content_type = "application/json"),
+    )
+)]
 
 async fn sub_list(
     state: State<Arc<AppState>>,
@@ -2389,6 +2887,21 @@ async fn sub_list(
     list_items(state, headers, query, Some(class)).await
 }
 
+/// Retrieve one subregister item as of an instant.
+#[utoipa::path(
+    get,
+    path = "/{class}/{id}",
+    tag = "register",
+    params(
+        ("class" = String, Path, description = "The subregister's class plural"),
+        ("id" = String, Path, description = "The item identifier"),
+    ),
+    responses(
+        (status = 200, description = "The item view, as-of stamped", body = Value, content_type = "application/json"),
+        (status = 404, description = "No such item as of the requested instant"),
+    )
+)]
+
 async fn sub_get(
     state: State<Arc<AppState>>,
     Extension(class): Extension<ItemClass>,
@@ -2397,6 +2910,23 @@ async fn sub_get(
 ) -> Result<Response, Response> {
     get_item(state, query, path, Some(class)).await
 }
+
+/// Supersede a subregister item's current version.
+#[utoipa::path(
+    post,
+    path = "/{class}/{id}/versions",
+    tag = "register",
+    params(
+        ("class" = String, Path, description = "The subregister's class plural"),
+        ("id" = String, Path, description = "The item identifier"),
+    ),
+    request_body(content = Value, description = "The successor version and its manifest"),
+    responses(
+        (status = 201, description = "Superseded; the new version, the superseded version and the item view are stated", body = Value, content_type = "application/json"),
+        (status = 400, description = "No valid version to supersede or an invalid body"),
+        (status = 401, description = "A bearer token is configured and the request does not carry it"),
+    )
+)]
 
 async fn sub_supersede(
     state: State<Arc<AppState>>,
@@ -2408,6 +2938,21 @@ async fn sub_supersede(
 ) -> Result<Response, Response> {
     supersede_item(state, headers, query, path, body, Some(class)).await
 }
+
+/// The supersession chain of a subregister item.
+#[utoipa::path(
+    get,
+    path = "/{class}/{id}/supersession",
+    tag = "register",
+    params(
+        ("class" = String, Path, description = "The subregister's class plural"),
+        ("id" = String, Path, description = "The item identifier"),
+    ),
+    responses(
+        (status = 200, description = "The chain, as-of stamped", body = Value, content_type = "application/json"),
+        (status = 404, description = "No such item"),
+    )
+)]
 
 async fn sub_chain(
     state: State<Arc<AppState>>,
@@ -2422,65 +2967,178 @@ async fn sub_chain(
 /// class-scoped.
 fn subregister(app: Arc<AppState>, class: ItemClass) -> Router {
     Router::new()
-        .route("/", post(sub_create).get(sub_list))
-        .route("/{id}", get(sub_get))
-        .route("/{id}/versions", post(sub_supersede))
-        .route("/{id}/supersession", get(sub_chain))
+        .route(paths::SUB_ROOT, post(sub_create).get(sub_list))
+        .route(paths::SUB_ONE, get(sub_get))
+        .route(paths::SUB_VERSIONS, post(sub_supersede))
+        .route(paths::SUB_CHAIN, get(sub_chain))
         .layer(Extension(class))
         .with_state(app)
 }
 
+// ---------------------------------------------------------------------------
+// Interface contract
+// ---------------------------------------------------------------------------
+
+/// The routed paths, declared once. The router routes by these
+/// constants, the contract document is tested against them, and no
+/// route may be declared with a raw literal (the gates enforce both).
+/// The SUB_* constants are the subregister's relative routes; the
+/// SUB_TEMPLATE_* constants are the class-generic templates the
+/// contract document speaks for the mounted surface.
+pub mod paths {
+    pub const ROOT: &str = "/";
+    pub const HEALTHZ: &str = "/healthz";
+    pub const ITEMS: &str = "/items";
+    pub const ITEM: &str = "/items/{id}";
+    pub const ITEM_VERSIONS: &str = "/items/{id}/versions";
+    pub const ITEM_CHAIN: &str = "/items/{id}/supersession";
+    pub const APPLICABILITY: &str = "/applicability";
+    pub const SERVICES: &str = "/services";
+    pub const SERVICE: &str = "/services/{id}";
+    pub const SERVICE_VERSIONS: &str = "/services/{id}/versions";
+    pub const SERVICE_CHAIN: &str = "/services/{id}/supersession";
+    pub const PROTOCOL_BINDINGS: &str = "/protocol-bindings";
+    pub const PROTOCOL_BINDING: &str = "/protocol-bindings/{id}";
+    pub const VERIFICATION_MECHANISMS: &str = "/verification-mechanisms";
+    pub const VERIFICATION_MECHANISM: &str = "/verification-mechanisms/{id}";
+    pub const ADMIN_LOG: &str = "/admin/log";
+    pub const ADMIN_SEED: &str = "/admin/seed";
+    pub const PROFILE_MANIFEST_SCHEMA: &str = "/schemas/profile-manifest";
+    pub const MODELS: &str = "/models";
+    pub const MODEL: &str = "/models/{id}";
+    pub const MODEL_VALIDATE: &str = "/models/{id}/validate";
+    pub const CROSS_REGISTER_MAPPINGS: &str = "/cross-register-mappings";
+    pub const CROSS_REGISTER_MAPPING: &str = "/cross-register-mappings/{id}";
+    pub const CROSS_REGISTER_MAPPING_VERSIONS: &str =
+        "/cross-register-mappings/{id}/versions";
+    pub const CROSS_REGISTER_MAPPING_CHAIN: &str =
+        "/cross-register-mappings/{id}/supersession";
+    /// The class-generic subregister surface: mounted per item class
+    /// at its plural (data-elements, profiles, crypto-suites,
+    /// transforms, trust-anchors, units).
+    pub const SUB_TEMPLATES: [&str; 4] = [
+        "/{class}",
+        "/{class}/{id}",
+        "/{class}/{id}/versions",
+        "/{class}/{id}/supersession",
+    ];
+    /// The subregister's relative routes (nested under the class
+    /// plural).
+    pub const SUB_ROOT: &str = "/";
+    pub const SUB_ONE: &str = "/{id}";
+    pub const SUB_VERSIONS: &str = "/{id}/versions";
+    pub const SUB_CHAIN: &str = "/{id}/supersession";
+    /// The contract document itself (not an operation of the API).
+    pub const CONTRACT_YAML: &str = "/openapi.yaml";
+}
+
+/// The OpenAPI model: one declaration per handler (`#[utoipa::path]`),
+/// from which the served contract, the golden file and Swagger UI all
+/// derive. The subregister surface is spoken class-generically: its
+/// operations live under the `{class}` templates.
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "UniDPP registry",
+        version = env!("CARGO_PKG_VERSION"),
+        description = "UniDPP ISO 19135 register service: item registration, version supersession, point-in-time resolution, applicability bindings, EXPRESS model deposits, and the discovery registry (C3 services, C4 protocol bindings, C5 verification mechanisms). Reads are public; mutations require `Authorization: Bearer <UNIDPP_REGISTRY_ADMIN_TOKEN>` where a token is configured. Collection reads are content-negotiated (`Accept: text/cddal` serves the canonical dictionary form). The class-generic subregister surface is mounted at each item class's plural (data-elements, profiles, crypto-suites, transforms, trust-anchors, units) and is spoken here under the `{class}` templates.",
+        license(name = "Apache-2.0", identifier = "Apache-2.0"),
+    ),
+    paths(
+        discovery, healthz,
+        create_items, list_all_items, get_one_item, supersede_one_item, one_item_chain,
+        applicability_query, bind_applicability,
+        create_service, list_services, get_service, supersede_service, service_chain,
+        list_protocol_bindings, create_protocol_binding, get_protocol_binding,
+        list_verification_mechanisms, create_verification_mechanism, get_verification_mechanism,
+        admin_log, admin_seed, get_profile_manifest_schema,
+        deposit_model, list_models, get_model, validate_model,
+        mappings_get_or_list, mappings_create, mappings_get_one, mappings_supersede_one, mappings_chain,
+        sub_create, sub_list, sub_get, sub_supersede, sub_chain,
+    ),
+    tags(
+        (name = "register", description = "The ISO 19135 register: items, subregisters, cross-register mappings, the manifest schema"),
+        (name = "applicability", description = "Profile-to-product-type bindings and their clock predicates"),
+        (name = "discovery", description = "The discovery registry: C3 services, C4 protocol bindings, C5 verification mechanisms"),
+        (name = "models", description = "EXPRESS and CDDAL semantic model deposits"),
+        (name = "admin", description = "The operator surface: the audit log and seeding"),
+    )
+)]
+struct ApiDoc;
+
+/// The contract document: the OpenAPI model plus the deployment keys
+/// (`x-unidpp-env-keys`). Served at `/openapi.yaml` and committed as
+/// the golden `openapi.yaml`.
+pub fn contract_yaml() -> String {
+    let mut doc = serde_json::to_value(ApiDoc::openapi()).expect("contract serializes");
+    doc["info"]["x-unidpp-env-keys"] = json!(Config::ENV_KEYS);
+    serde_yaml::to_string(&doc).expect("contract renders as YAML")
+}
+
+async fn openapi_yaml() -> Result<Response, Response> {
+    Ok(build_response(
+        StatusCode::OK,
+        vec![
+            ("content-type".into(), "application/yaml".into()),
+            ("x-as-of".into(), Timestamp::now().to_string()),
+        ],
+        contract_yaml(),
+    ))
+}
+
 pub fn router(app: Arc<AppState>) -> Router {
     let mut r = Router::new()
-        .route("/", get(discovery))
-        .route("/healthz", get(healthz))
-        .route("/items", get(list_all_items).post(create_items))
-        .route("/items/{id}", get(get_one_item))
-        .route("/items/{id}/versions", post(supersede_one_item))
-        .route("/items/{id}/supersession", get(one_item_chain))
+        .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))
+        .route(paths::ROOT, get(discovery))
+        .route(paths::HEALTHZ, get(healthz))
+        .route(paths::ITEMS, get(list_all_items).post(create_items))
+        .route(paths::ITEM, get(get_one_item))
+        .route(paths::ITEM_VERSIONS, post(supersede_one_item))
+        .route(paths::ITEM_CHAIN, get(one_item_chain))
         .route(
-            "/applicability",
+            paths::APPLICABILITY,
             get(applicability_query).post(bind_applicability),
         )
-        .route("/services", get(list_services).post(create_service))
-        .route("/services/{id}", get(get_service))
-        .route("/services/{id}/versions", post(supersede_service))
-        .route("/services/{id}/supersession", get(service_chain))
+        .route(paths::SERVICES, get(list_services).post(create_service))
+        .route(paths::SERVICE, get(get_service))
+        .route(paths::SERVICE_VERSIONS, post(supersede_service))
+        .route(paths::SERVICE_CHAIN, get(service_chain))
         .route(
-            "/protocol-bindings",
+            paths::PROTOCOL_BINDINGS,
             get(list_protocol_bindings).post(create_protocol_binding),
         )
-        .route("/protocol-bindings/{id}", get(get_protocol_binding))
+        .route(paths::PROTOCOL_BINDING, get(get_protocol_binding))
         .route(
-            "/verification-mechanisms",
+            paths::VERIFICATION_MECHANISMS,
             get(list_verification_mechanisms).post(create_verification_mechanism),
         )
         .route(
-            "/verification-mechanisms/{id}",
+            paths::VERIFICATION_MECHANISM,
             get(get_verification_mechanism),
         )
-        .route("/admin/log", get(admin_log))
-        .route("/admin/seed", post(admin_seed))
+        .route(paths::ADMIN_LOG, get(admin_log))
+        .route(paths::ADMIN_SEED, post(admin_seed))
         .route(
-            "/schemas/profile-manifest",
+            paths::PROFILE_MANIFEST_SCHEMA,
             get(get_profile_manifest_schema),
         )
-        .route("/models", get(list_models).post(deposit_model))
-        .route("/models/{id}", get(get_model))
-        .route("/models/{id}/validate", post(validate_model))
+        .route(paths::MODELS, get(list_models).post(deposit_model))
+        .route(paths::MODEL, get(get_model))
+        .route(paths::MODEL_VALIDATE, post(validate_model))
         .route(
-            "/cross-register-mappings",
+            paths::CROSS_REGISTER_MAPPINGS,
             get(mappings_get_or_list).post(mappings_create),
         )
-        .route("/cross-register-mappings/{id}", get(mappings_get_one))
+        .route(paths::CROSS_REGISTER_MAPPING, get(mappings_get_one))
         .route(
-            "/cross-register-mappings/{id}/versions",
+            paths::CROSS_REGISTER_MAPPING_VERSIONS,
             post(mappings_supersede_one),
         )
         .route(
-            "/cross-register-mappings/{id}/supersession",
+            paths::CROSS_REGISTER_MAPPING_CHAIN,
             get(mappings_chain),
         )
+        .route(paths::CONTRACT_YAML, get(openapi_yaml))
         .with_state(app.clone());
     // Model and cross-register-mapping have dedicated surfaces
     // (deposit semantics / directional lookup); every other class
@@ -2646,3 +3304,4 @@ mod tests {
         assert!(store.item("unidpp-core-express").is_none());
     }
 }
+
