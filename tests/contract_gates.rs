@@ -178,9 +178,7 @@ async fn the_router_serves_the_contract_exactly() {
     let ts = TestServer::spawn(Config::default()).await.expect("server");
     let class = a_mounted_class();
     for (path, methods) in documented() {
-        let concrete = path
-            .replace("{class}", &class)
-            .replace("{id}", "probe-x");
+        let concrete = path.replace("{class}", &class).replace("{id}", "probe-x");
         for verb in VERBS {
             let resp = request(
                 &verb.to_uppercase(),

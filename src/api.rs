@@ -3009,10 +3009,8 @@ pub mod paths {
     pub const MODEL_VALIDATE: &str = "/models/{id}/validate";
     pub const CROSS_REGISTER_MAPPINGS: &str = "/cross-register-mappings";
     pub const CROSS_REGISTER_MAPPING: &str = "/cross-register-mappings/{id}";
-    pub const CROSS_REGISTER_MAPPING_VERSIONS: &str =
-        "/cross-register-mappings/{id}/versions";
-    pub const CROSS_REGISTER_MAPPING_CHAIN: &str =
-        "/cross-register-mappings/{id}/supersession";
+    pub const CROSS_REGISTER_MAPPING_VERSIONS: &str = "/cross-register-mappings/{id}/versions";
+    pub const CROSS_REGISTER_MAPPING_CHAIN: &str = "/cross-register-mappings/{id}/supersession";
     /// The class-generic subregister surface: mounted per item class
     /// at its plural (data-elements, profiles, crypto-suites,
     /// transforms, trust-anchors, units).
@@ -3134,10 +3132,7 @@ pub fn router(app: Arc<AppState>) -> Router {
             paths::CROSS_REGISTER_MAPPING_VERSIONS,
             post(mappings_supersede_one),
         )
-        .route(
-            paths::CROSS_REGISTER_MAPPING_CHAIN,
-            get(mappings_chain),
-        )
+        .route(paths::CROSS_REGISTER_MAPPING_CHAIN, get(mappings_chain))
         .route(paths::CONTRACT_YAML, get(openapi_yaml))
         .with_state(app.clone());
     // Model and cross-register-mapping have dedicated surfaces
@@ -3304,4 +3299,3 @@ mod tests {
         assert!(store.item("unidpp-core-express").is_none());
     }
 }
-
