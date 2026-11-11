@@ -10,6 +10,9 @@
 //! | [`ProfileManifestSchemaCheck`] | profile | the manifest conforms to the generated JSON Schema (item 51) |
 //! | [`ProfileSatisfiabilityCheck`] | profile | capability demands are servable by the declared subject class (item 71) |
 //! | [`CrossRegisterMappingCheck`] | cross-register-mapping | manifest shape + referential integrity of both ends (item 57) |
+//! | [`ClassDescriptorSignatureCheck`] | class-descriptor | the descriptor registers only in its SIGNED form (R10 B1) |
+//! | [`ClassDescriptorManifestCheck`] | class-descriptor | the descriptor's shape: features, capabilities, rule references (R10 B1) |
+//! | [`InstanceAgainstClassCheck`] | instance | the instance validates against the descriptor it names (R10 B2) |
 //!
 //! Errors reject the intake (HTTP 400 with the field paths);
 //! warnings (only the satisfiability check emits them, under
@@ -76,6 +79,9 @@ pub fn default_chain() -> Vec<Box<dyn IntakeCheck>> {
         Box::new(ProfileManifestSchemaCheck),
         Box::new(ProfileSatisfiabilityCheck),
         Box::new(CrossRegisterMappingCheck),
+        Box::new(crate::class_descriptor::ClassDescriptorSignatureCheck),
+        Box::new(crate::class_descriptor::ClassDescriptorManifestCheck),
+        Box::new(crate::class_descriptor::InstanceAgainstClassCheck),
     ]
 }
 

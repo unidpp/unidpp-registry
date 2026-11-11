@@ -465,7 +465,7 @@ fn find_item<'a>(
     )
 )]
 
-async fn discovery() -> Result<Response, Response> {
+async fn discovery(State(app): State<Arc<AppState>>) -> Result<Response, Response> {
     let mut subregisters = Map::new();
     for class in ItemClass::ALL {
         subregisters.insert(
@@ -473,6 +473,38 @@ async fn discovery() -> Result<Response, Response> {
             json!({"class": class.as_str(), "path": format!("/{}", class.plural())}),
         );
     }
+    // The registered class descriptors surface beside the service
+    // descriptors (R10 G6): a verifier meeting an unknown CLASS
+    // resolves the class's own machine-checkable descriptor here.
+    let store = app.store.lock().expect("store lock poisoned");
+    let class_descriptors: Vec<Value> = store
+        .items_filtered(Some(ItemClass::ClassDescriptor), None)
+        .iter()
+        .map(|descriptor| {
+            let features = descriptor
+                .manifest
+                .as_ref()
+                .and_then(|m| crate::class_descriptor::parse_features(m).ok())
+                .unwrap_or_default();
+            json!({
+                "class_id": descriptor.identifier,
+                "title": descriptor.title,
+                "register": descriptor.register,
+                "features": features
+                    .iter()
+                    .map(|f| json!({
+                        "path": f.path,
+                        "kind": f.kind,
+                        "required": f.required,
+                        "vocabulary": f.vocabulary,
+                        "unit": f.unit,
+                    }))
+                    .collect::<Vec<_>>(),
+                "subregister": format!("/{}", ItemClass::ClassDescriptor.plural()),
+            })
+        })
+        .collect();
+    drop(store);
     let doc = json!({
         "service": "unidpp-registry",
         "version": env!("CARGO_PKG_VERSION"),
@@ -526,7 +558,8 @@ async fn discovery() -> Result<Response, Response> {
             "service_descriptor_signature": "Ed25519 over canonical-JSON of body (signature block excluded); operator id is content-derived from the public key",
             "operator_keyring": "seeded dev keyring: unidpp-{registry,issuer,resolver,trust,log,archive,cli-verifier,edge}; loaded at startup; signatures are verified at intake only (replay re-applies the stored record)"
         },
-        "intake_checks": ["profile-signature-required", "profile-manifest-schema", "profile-satisfiability", "cross-register-mapping-integrity"],
+        "intake_checks": ["profile-signature-required", "profile-manifest-schema", "profile-satisfiability", "cross-register-mapping-integrity", "class-descriptor-signature-required", "class-descriptor-manifest", "instance-against-class"],
+        "class_descriptors": Value::Array(class_descriptors),
         "model_validation": "expressir (gem install expressir; `expressir validate load` run as a subprocess); deposits without expressir on PATH are stored with validation.status = pending",
         "auth": "mutations require a Bearer token when UNIDPP_REGISTRY_ADMIN_TOKEN is set"
     });
@@ -3261,6 +3294,59 @@ pub fn seed_express_deposit(app: &Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn discovery_surfaces_the_class_descriptors() {
+        let app = Arc::new(AppState::new(Config::default()).unwrap());
+        let descriptor = Item {
+            identifier: "tyre-e8".to_string(),
+            register: "unidpp-registry".to_string(),
+            item_class: ItemClass::ClassDescriptor,
+            title: "The E8 tyre class".to_string(),
+            submitting_organization: None,
+            versions: Vec::new(),
+            manifest: Some(serde_json::json!({
+                "class_id": "tyre-e8",
+                "issuer_class": "consensus",
+                "issuer": "urn:unidpp:actor:consortium",
+                "signature": {"signature": "dGVzdC1zaWduYXR1cmU"},
+                "features": [
+                    {"path": "tyre.pressure-bar", "kind": "decimal", "required": true, "unit": "bar"},
+                    {"path": "tyre.season", "kind": "string", "required": true,
+                     "vocabulary": ["summer", "winter"]}
+                ],
+                "capability_classes": ["silent"],
+                "rule_references": []
+            })),
+        };
+        {
+            let mut store = app.store.lock().expect("store poisoned");
+            crate::intake::run(
+                &crate::intake::default_chain(),
+                &descriptor,
+                &crate::intake::IntakeContext {
+                    store: &store,
+                    strict: true,
+                },
+            )
+            .expect("the descriptor passes intake");
+            store.register_item(descriptor).expect("registered");
+        }
+        let discovery = discovery(axum::extract::State(app.clone()))
+            .await
+            .expect("served");
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(discovery.into_body(), usize::MAX)
+                .await
+                .expect("body"),
+        )
+        .expect("json");
+        let listed = body["class_descriptors"].as_array().expect("descriptors");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["class_id"], "tyre-e8");
+        assert_eq!(listed[0]["features"].as_array().map(Vec::len), Some(2));
+        assert_eq!(listed[0]["features"][0]["unit"], "bar");
+    }
 
     #[tokio::test]
     async fn express_seed_deposits_once_with_hash_and_validation() {

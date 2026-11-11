@@ -51,10 +51,21 @@ pub enum ItemClass {
     /// A mapping between items of two registers, itself a registered
     /// item (item 57 / T-07, ISO 19135 harmonization).
     CrossRegisterMapping,
+    /// A class descriptor (R10 G6): the machine-checkable declaration
+    /// of an author-defined passport class — its features, their
+    /// value kinds, vocabularies and units, the capability classes
+    /// that may carry the class, and the rule references it relies
+    /// on. Signed, like a profile manifest.
+    ClassDescriptor,
+    /// An instance of an author-defined class (R10 G3): its manifest
+    /// carries `instance_of` (the descriptor's identifier) and the
+    /// twin-fact map; intake validates the instance against the
+    /// descriptor it names.
+    Instance,
 }
 
 impl ItemClass {
-    pub const ALL: [ItemClass; 8] = [
+    pub const ALL: [ItemClass; 10] = [
         ItemClass::DataElement,
         ItemClass::Profile,
         ItemClass::CryptoSuite,
@@ -63,6 +74,8 @@ impl ItemClass {
         ItemClass::Unit,
         ItemClass::Model,
         ItemClass::CrossRegisterMapping,
+        ItemClass::ClassDescriptor,
+        ItemClass::Instance,
     ];
 
     /// Canonical (singular) class name, as stored on the item.
@@ -76,6 +89,8 @@ impl ItemClass {
             ItemClass::Unit => "unit",
             ItemClass::Model => "model",
             ItemClass::CrossRegisterMapping => "cross-register-mapping",
+            ItemClass::ClassDescriptor => "class-descriptor",
+            ItemClass::Instance => "instance",
         }
     }
 
@@ -91,6 +106,8 @@ impl ItemClass {
             ItemClass::Unit => "units",
             ItemClass::Model => "models",
             ItemClass::CrossRegisterMapping => "cross-register-mappings",
+            ItemClass::ClassDescriptor => "class-descriptors",
+            ItemClass::Instance => "instances",
         }
     }
 
@@ -641,7 +658,17 @@ mod tests {
             ItemClass::CrossRegisterMapping.plural(),
             "cross-register-mappings"
         );
-        assert_eq!(ItemClass::ALL.len(), 8);
+        // the R10 classes: descriptors and instances
+        assert_eq!(
+            ItemClass::parse("class-descriptor"),
+            Some(ItemClass::ClassDescriptor)
+        );
+        assert_eq!(
+            ItemClass::parse("class_descriptors"),
+            Some(ItemClass::ClassDescriptor)
+        );
+        assert_eq!(ItemClass::parse("instances"), Some(ItemClass::Instance));
+        assert_eq!(ItemClass::ALL.len(), 10);
     }
 
     #[test]

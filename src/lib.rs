@@ -34,6 +34,7 @@
 
 pub mod api;
 pub mod cddal;
+pub mod class_descriptor;
 pub mod clock;
 pub mod discovery;
 pub mod express;
