@@ -42,6 +42,7 @@ pub mod intake;
 pub mod manifest;
 pub mod mapping;
 pub mod model;
+pub mod rules;
 pub mod satisfiability;
 pub mod schema;
 pub mod store;

@@ -361,7 +361,63 @@ impl IntakeCheck for ClassDescriptorManifestCheck {
                 message: "the descriptor states the capability classes that may carry it".into(),
             }),
         }
-        // The rule references (G4's seam: present, uninterpreted).
+        // The rule references (G4's seam), now with their
+        // deterministic reading: every reference resolves to a rule
+        // the descriptor declares in `rules`, and each expression
+        // parses and reads only declared features with compatible
+        // kinds.
+        let features_for_rules = match parse_features(m) {
+            Ok(specs) => specs
+                .iter()
+                .map(|spec| (spec.path.clone(), spec.kind.clone()))
+                .collect::<std::collections::BTreeMap<String, String>>(),
+            Err(_) => std::collections::BTreeMap::new(),
+        };
+        let declared_rules = match m.get("rules").and_then(|v| v.as_array()) {
+            Some(rules) => {
+                let mut ids: Vec<&str> = Vec::new();
+                for (index, rule) in rules.iter().enumerate() {
+                    let id = rule.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    if id.trim().is_empty() {
+                        errors.push(IntakeError {
+                            check: self.name(),
+                            path: format!("manifest.rules[{index}].id"),
+                            message: "a rule states its id".into(),
+                        });
+                        continue;
+                    }
+                    if ids.contains(&id) {
+                        errors.push(IntakeError {
+                            check: self.name(),
+                            path: format!("manifest.rules[{index}].id"),
+                            message: format!("the rule id `{id}` is declared twice"),
+                        });
+                    }
+                    ids.push(id);
+                    let expression = rule.get("expr").and_then(|v| v.as_str()).unwrap_or("");
+                    match crate::rules::parse(expression) {
+                        Ok(parsed) => {
+                            for message in
+                                crate::rules::descriptor_errors(&parsed, &features_for_rules)
+                            {
+                                errors.push(IntakeError {
+                                    check: self.name(),
+                                    path: format!("manifest.rules[{index}].expr"),
+                                    message,
+                                });
+                            }
+                        }
+                        Err(parse_error) => errors.push(IntakeError {
+                            check: self.name(),
+                            path: format!("manifest.rules[{index}].expr"),
+                            message: format!("the expression does not parse: {parse_error}"),
+                        }),
+                    }
+                }
+                Some(ids)
+            }
+            None => None,
+        };
         match m.get("rule_references").and_then(|v| v.as_array()) {
             Some(rules) => {
                 for (index, rule) in rules.iter().enumerate() {
@@ -371,6 +427,17 @@ impl IntakeCheck for ClassDescriptorManifestCheck {
                             check: self.name(),
                             path: format!("manifest.rule_references[{index}]"),
                             message: "a rule reference is a non-empty rule id".into(),
+                        });
+                        continue;
+                    }
+                    let declared: Option<Vec<&str>> = declared_rules.as_ref().map(|v| v.to_vec());
+                    if declared.as_ref().map(|ids| !ids.contains(&token)).unwrap_or(true) {
+                        errors.push(IntakeError {
+                            check: self.name(),
+                            path: format!("manifest.rule_references[{index}]"),
+                            message: format!(
+                                "the rule reference `{token}` names no rule the descriptor declares in `rules`"
+                            ),
                         });
                     }
                 }
@@ -534,6 +601,52 @@ impl IntakeCheck for InstanceAgainstClassCheck {
                 }
             }
         }
+        // The referenced rules read deterministically (G4): every
+        // referenced rule evaluates over the instance's facts, and a
+        // failing rule names its id and its expression.
+        let rules: Vec<(String, String)> = descriptor_manifest
+            .get("rules")
+            .and_then(|v| v.as_array())
+            .map(|list| {
+                list.iter()
+                    .filter_map(|rule| {
+                        let id = rule.get("id")?.as_str()?.to_string();
+                        let expr = rule.get("expr")?.as_str()?.to_string();
+                        Some((id, expr))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let references = descriptor_manifest
+            .get("rule_references")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for reference in &references {
+            let Some(rule_id) = reference.as_str() else {
+                continue;
+            };
+            let Some((_, expression)) = rules.iter().find(|(id, _)| id == rule_id) else {
+                continue; // the descriptor intake refuses dangling references
+            };
+            match crate::rules::parse(expression) {
+                Ok(parsed) => {
+                    if !crate::rules::eval(&parsed, &features) {
+                        errors.push(IntakeError {
+                            check: self.name(),
+                            path: format!("manifest.rule_references.{rule_id}"),
+                            message: format!(
+                                "the rule `{rule_id}` of the class `{class_id}` is not satisfied: {expression}"
+                            ),
+                        });
+                    }
+                }
+                Err(_) => {
+                    continue; // the descriptor intake refuses unparseable rules
+                }
+            }
+        }
+
         // The descriptor's unit references resolve against the
         // registered units.
         for spec in &specs {
@@ -601,7 +714,10 @@ mod tests {
             "signature": {"signature": "dGVzdC1zaWduYXR1cmU"},
             "features": features,
             "capability_classes": ["silent", "logged-contact"],
-            "rule_references": ["rule.pressure-range"]
+            "rule_references": ["rule.pressure-range"],
+            "rules": [
+                {"id": "rule.pressure-range", "expr": "tyre.pressure-bar >= 1.0 and tyre.pressure-bar <= 4.5"}
+            ]
         })
     }
 
@@ -830,6 +946,68 @@ mod tests {
         )
         .unwrap_err();
         assert!(errors.iter().any(|e| e.message.contains("unknown class")));
+    }
+
+    #[test]
+    fn a_rule_reference_without_a_declared_rule_refuses() {
+        let store = Store::open(None).unwrap();
+        let mut manifest = signed_descriptor("tyre-e8", tyre_features());
+        manifest["rules"] = json!([]);
+        let descriptor = item(ItemClass::ClassDescriptor, "tyre-e8", manifest);
+        let errors = run(&default_descriptor_chain(), &descriptor, &ctx(&store)).unwrap_err();
+        assert!(errors.iter().any(|e| e.message.contains("names no rule")));
+    }
+
+    #[test]
+    fn an_unparseable_rule_refuses_with_the_offset_named() {
+        let store = Store::open(None).unwrap();
+        let mut manifest = signed_descriptor("tyre-e8", tyre_features());
+        manifest["rules"] = json!([
+            {"id": "rule.pressure-range", "expr": "tyre.pressure-bar >"}
+        ]);
+        let descriptor = item(ItemClass::ClassDescriptor, "tyre-e8", manifest);
+        let errors = run(&default_descriptor_chain(), &descriptor, &ctx(&store)).unwrap_err();
+        assert!(errors.iter().any(|e| e.message.contains("does not parse")));
+    }
+
+    #[test]
+    fn an_expression_naming_an_undeclared_path_refuses() {
+        let store = Store::open(None).unwrap();
+        let mut manifest = signed_descriptor("tyre-e8", tyre_features());
+        manifest["rules"] = json!([
+            {"id": "rule.depth", "expr": "tyre.depth > 2"}
+        ]);
+        manifest["rule_references"] = json!(["rule.depth"]);
+        let descriptor = item(ItemClass::ClassDescriptor, "tyre-e8", manifest);
+        let errors = run(&default_descriptor_chain(), &descriptor, &ctx(&store)).unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|e| e.message.contains("tyre.depth") && e.message.contains("does not declare")));
+    }
+
+    #[test]
+    fn an_ordering_rule_on_a_string_feature_refuses() {
+        let store = Store::open(None).unwrap();
+        let mut manifest = signed_descriptor("tyre-e8", tyre_features());
+        manifest["rules"] = json!([
+            {"id": "rule.season-order", "expr": "tyre.season > \"winter\""}
+        ]);
+        manifest["rule_references"] = json!(["rule.season-order"]);
+        let descriptor = item(ItemClass::ClassDescriptor, "tyre-e8", manifest);
+        let errors = run(&default_descriptor_chain(), &descriptor, &ctx(&store)).unwrap_err();
+        assert!(errors.iter().any(|e| e.message.contains("decimal-only")));
+    }
+
+    #[test]
+    fn an_instance_failing_a_referenced_rule_refuses_by_name() {
+        let store = store_with_descriptor();
+        let mut failing = conforming_instance();
+        failing.manifest.as_mut().unwrap()["features"]["tyre.pressure-bar"] = json!(9.9);
+        let errors = run(&default_chain(), &failing, &ctx(&store)).unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|e| e.message.contains("rule.pressure-range")
+                && e.message.contains("not satisfied")));
     }
 
     fn default_descriptor_chain() -> Vec<Box<dyn IntakeCheck>> {
