@@ -19,6 +19,8 @@ rust-version = "1.75"
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "net", "io-util", "rt-multi-thread", "time"] }
 serde_json = "1"
+unidpp-model = { path = "../unidpp-core/crates/model" }
+unidpp-semantics = { path = "../unidpp-core/crates/semantics" }
 ed25519-dalek = "2"
 sha2 = "0.10"
 serde_yaml = "0.9"

@@ -1119,6 +1119,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
+name = "unidpp-grid"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "unidpp-model",
+]
+
+[[package]]
+name = "unidpp-model"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "unidpp-registry"
 version = "0.1.0"
 dependencies = [
@@ -1128,8 +1144,20 @@ dependencies = [
  "serde_yaml",
  "sha2 0.10.9",
  "tokio",
+ "unidpp-model",
+ "unidpp-semantics",
  "utoipa",
  "utoipa-swagger-ui",
+]
+
+[[package]]
+name = "unidpp-semantics"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "unidpp-grid",
+ "unidpp-model",
 ]
 
 [[package]]

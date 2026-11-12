@@ -322,6 +322,97 @@ impl IntakeCheck for CrossRegisterMappingCheck {
                 })
                 .collect()
         };
+        // Two registered forms (clause 15's intake duty): the
+        // relation form (source/target/mapping_type, the ISO 19135
+        // harmonization vocabulary) and the tier form (source/target/
+        // version/kind, the three-tier discipline's canonical shape).
+        // The tier form validates against the semantics crate's own
+        // MappingItem — the corpus pins its canonical bytes.
+        if m.get("kind").is_some() {
+            let parsed: Result<unidpp_semantics::mapping::MappingItem, _> =
+                serde_json::from_value(m.clone());
+            let item = parsed.map_err(|e| {
+                vec![IntakeError {
+                    check: self.name(),
+                    path: "manifest".into(),
+                    message: format!("the tier-form mapping does not parse as a MappingItem: {e}"),
+                }]
+            })?;
+            let mut errors = Vec::new();
+            // Tier duties the parse cannot see: a tier-2
+            // correspondence declares its scope and its residual
+            // verbatim; a tier-3 record states why it exists; a
+            // tier-1 mapping names a registered transform.
+            match &item.kind {
+                unidpp_semantics::mapping::MappingKind::Correspondence {
+                    scope,
+                    residual,
+                    attester,
+                } => {
+                    if scope.is_empty() {
+                        errors.push(IntakeError {
+                            check: self.name(),
+                            path: "manifest.kind.scope".into(),
+                            message: "a tier-2 correspondence declares its scope (what it covers)"
+                                .into(),
+                        });
+                    }
+                    if residual.trim().is_empty() {
+                        errors.push(IntakeError {
+                            check: self.name(),
+                            path: "manifest.kind.residual".into(),
+                            message: "a tier-2 correspondence states its residual (what it does not cover)".into(),
+                        });
+                    }
+                    if attester.trim().is_empty() {
+                        errors.push(IntakeError {
+                            check: self.name(),
+                            path: "manifest.kind.attester".into(),
+                            message: "a tier-2 correspondence names its attester".into(),
+                        });
+                    }
+                }
+                unidpp_semantics::mapping::MappingKind::NoMapping { note } => {
+                    if note.trim().is_empty() {
+                        errors.push(IntakeError {
+                            check: self.name(),
+                            path: "manifest.kind.note".into(),
+                            message: "a tier-3 record states why no correspondence is asserted"
+                                .into(),
+                        });
+                    }
+                }
+                unidpp_semantics::mapping::MappingKind::Deterministic { transform } => {
+                    if transform.trim().is_empty() {
+                        errors.push(IntakeError {
+                            check: self.name(),
+                            path: "manifest.kind.transform".into(),
+                            message: "a tier-1 mapping names its registered, versioned transform"
+                                .into(),
+                        });
+                    }
+                }
+            }
+            // Referential integrity: both ends resolve to registered
+            // items (the identifier before any @version pin).
+            for (side, reference) in [("source", &item.source), ("target", &item.target)] {
+                let identifier = reference.split('@').next().unwrap_or(reference);
+                if ctx.store.item(identifier).is_none() {
+                    errors.push(IntakeError {
+                        check: self.name(),
+                        path: format!("manifest.{side}"),
+                        message: format!(
+                            "dangling reference: no registry item `{identifier}` names the {side} end"
+                        ),
+                    });
+                }
+            }
+            return if errors.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Err(errors)
+            };
+        }
         mapping::validate_manifest(m).map_err(to_errors)?;
         let parsed = mapping::parse(m).map_err(|e| {
             vec![IntakeError {
@@ -574,6 +665,108 @@ mod tests {
         // a mapping without a manifest is rejected outright
         let bare = item("map-3", ItemClass::CrossRegisterMapping, None);
         assert!(run(&default_chain(), &bare, &ctx).is_err());
+    }
+
+    #[test]
+    fn the_tier_form_registers_by_its_tier_duties() {
+        let mut store = Store::open(None).unwrap();
+        store
+            .register_item(item(
+                "urn:unidpp:elements:eu-battery",
+                ItemClass::DataElement,
+                None,
+            ))
+            .unwrap();
+        store
+            .register_item(item(
+                "urn:unidpp:elements:cn-battery",
+                ItemClass::DataElement,
+                None,
+            ))
+            .unwrap();
+        let ctx = IntakeContext {
+            store: &store,
+            strict: true,
+        };
+        // Tier 1: a deterministic mapping naming its transform.
+        let tier1 = item(
+            "map-tier-1",
+            ItemClass::CrossRegisterMapping,
+            Some(json!({
+                "source": "urn:unidpp:elements:eu-battery@1",
+                "target": "urn:unidpp:elements:cn-battery@1",
+                "version": 1,
+                "kind": {"tier": "deterministic", "transform": "urn:unidpp:transform:mass@4"}
+            })),
+        );
+        assert!(run(&default_chain(), &tier1, &ctx).is_ok());
+        // Tier 2: a correspondence with scope, residual and attester.
+        let tier2 = item(
+            "map-tier-2",
+            ItemClass::CrossRegisterMapping,
+            Some(json!({
+                "source": "urn:unidpp:elements:eu-battery@1",
+                "target": "urn:unidpp:elements:cn-battery@1",
+                "version": 1,
+                "kind": {"tier": "correspondence", "scope": ["carbon-footprint"],
+                         "residual": "recycled-content shares are not covered",
+                         "attester": "test-body"}
+            })),
+        );
+        assert!(run(&default_chain(), &tier2, &ctx).is_ok());
+        // Tier 3: the no-mapping record, with its note.
+        let tier3 = item(
+            "map-tier-3",
+            ItemClass::CrossRegisterMapping,
+            Some(json!({
+                "source": "urn:unidpp:elements:eu-battery@1",
+                "target": "urn:unidpp:elements:cn-battery@1",
+                "version": 1,
+                "kind": {"tier": "no-mapping", "note": "divergent legal bases recorded, not reconciled"}
+            })),
+        );
+        assert!(run(&default_chain(), &tier3, &ctx).is_ok());
+        // The tier duties refuse: a scope-less correspondence, a
+        // note-less tier-3, a transform-less tier-1, a dangling end.
+        let scopeless = item(
+            "map-bad-1",
+            ItemClass::CrossRegisterMapping,
+            Some(json!({
+                "source": "urn:unidpp:elements:eu-battery@1",
+                "target": "urn:unidpp:elements:cn-battery@1",
+                "version": 1,
+                "kind": {"tier": "correspondence", "scope": [],
+                         "residual": "x", "attester": "y"}
+            })),
+        );
+        let errors = run(&default_chain(), &scopeless, &ctx).unwrap_err();
+        assert!(errors.iter().any(|e| e.path == "manifest.kind.scope"));
+        let noteless = item(
+            "map-bad-2",
+            ItemClass::CrossRegisterMapping,
+            Some(json!({
+                "source": "urn:unidpp:elements:eu-battery@1",
+                "target": "urn:unidpp:elements:cn-battery@1",
+                "version": 1,
+                "kind": {"tier": "no-mapping", "note": " "}
+            })),
+        );
+        let errors = run(&default_chain(), &noteless, &ctx).unwrap_err();
+        assert!(errors.iter().any(|e| e.path == "manifest.kind.note"));
+        let dangling = item(
+            "map-bad-3",
+            ItemClass::CrossRegisterMapping,
+            Some(json!({
+                "source": "urn:unidpp:elements:absent-element@1",
+                "target": "urn:unidpp:elements:cn-battery@1",
+                "version": 1,
+                "kind": {"tier": "no-mapping", "note": "recorded"}
+            })),
+        );
+        let errors = run(&default_chain(), &dangling, &ctx).unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|e| e.message.contains("dangling reference")));
     }
 
     #[test]
